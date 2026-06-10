@@ -16,7 +16,13 @@ def generate(word: Word, conn: sqlite3.Connection, rng: random.Random):
     word_id = getattr(word, "db_id", 0)
     distractors = db.sample_words(conn, word.kind, word_id, N_OPTIONS - 1)
     if len(distractors) < N_OPTIONS - 1:  # tiny deck: take any kind
-        distractors = db.sample_words(conn, word.kind, word_id, 0)[: N_OPTIONS - 1]
+        seen = {w.lemma for w in distractors}
+        for candidate in db.sample_any_words(conn, word_id, N_OPTIONS - 1):
+            if candidate.lemma not in seen:
+                distractors.append(candidate)
+                seen.add(candidate.lemma)
+            if len(distractors) == N_OPTIONS - 1:
+                break
     options = [w.translation for w in distractors] + [word.translation]
     rng.shuffle(options)
     correct_idx = options.index(word.translation)

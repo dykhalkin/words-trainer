@@ -26,6 +26,11 @@ STAGE_TYPES = {
 }
 FALLBACK = ["flashcard_de_ru", "choice"]
 DEFAULT_NEW_PER_SESSION = 5
+STARTED_SCAN_LIMIT = 100
+
+
+def _stage_from_row(row) -> int:
+    return srs.stage(row["reps"], row["interval_days"])
 
 
 def pick_word(conn: sqlite3.Connection, rng: random.Random) -> tuple[Word, int] | None:
@@ -34,11 +39,41 @@ def pick_word(conn: sqlite3.Connection, rng: random.Random) -> tuple[Word, int] 
     if due:
         row = due[0]
         word = db.word_from_row(row)
-        return word, srs.stage(row["reps"], row["interval_days"])
+        return word, _stage_from_row(row)
     new = db.fetch_new(conn, limit=DEFAULT_NEW_PER_SESSION)
     if new:
         row = rng.choice(new)
         return db.word_from_row(row), 0
+    return None
+
+
+def pick_new_word(conn: sqlite3.Connection, rng: random.Random) -> tuple[Word, int] | None:
+    """A word with no progress yet."""
+    new = db.fetch_new(conn, limit=DEFAULT_NEW_PER_SESSION)
+    if not new:
+        return None
+    return db.word_from_row(rng.choice(new)), 0
+
+
+def pick_learning_word(conn: sqlite3.Connection) -> tuple[Word, int] | None:
+    """A started word that has not reached the mature review stage yet."""
+    for row in db.fetch_due(conn, limit=STARTED_SCAN_LIMIT):
+        stage = _stage_from_row(row)
+        if stage < 3:
+            return db.word_from_row(row), stage
+    for row in db.fetch_started(conn, limit=STARTED_SCAN_LIMIT):
+        stage = _stage_from_row(row)
+        if stage < 3:
+            return db.word_from_row(row), stage
+    return None
+
+
+def pick_review_word(conn: sqlite3.Connection) -> tuple[Word, int] | None:
+    """A mature word whose scheduled review time has come."""
+    for row in db.fetch_due(conn, limit=STARTED_SCAN_LIMIT):
+        stage = _stage_from_row(row)
+        if stage == 3:
+            return db.word_from_row(row), stage
     return None
 
 
@@ -48,6 +83,7 @@ def create_task(
     *,
     word_query: str | None = None,
     task_type: str | None = None,
+    queue: str = "auto",
 ) -> dict | None:
     rng = rng or random.Random()
 
@@ -58,7 +94,13 @@ def create_task(
         prog = db.get_progress(conn, word.db_id)
         stage = srs.stage(prog["reps"], prog["interval_days"]) if prog else 0
     else:
-        picked = pick_word(conn, rng)
+        pickers = {
+            "auto": lambda: pick_word(conn, rng),
+            "new": lambda: pick_new_word(conn, rng),
+            "learning": lambda: pick_learning_word(conn),
+            "review": lambda: pick_review_word(conn),
+        }
+        picked = pickers[queue]()
         if picked is None:
             return None
         word, stage = picked

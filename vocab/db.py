@@ -121,6 +121,14 @@ def sample_words(conn: sqlite3.Connection, kind: str, exclude_id: int, n: int) -
     return [word_from_row(r) for r in rows]
 
 
+def sample_any_words(conn: sqlite3.Connection, exclude_id: int, n: int) -> list[Word]:
+    rows = conn.execute(
+        "SELECT * FROM words WHERE id != ? ORDER BY RANDOM() LIMIT ?",
+        (exclude_id, n),
+    ).fetchall()
+    return [word_from_row(r) for r in rows]
+
+
 def get_progress(conn: sqlite3.Connection, word_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM progress WHERE word_id = ?", (word_id,)).fetchone()
 
@@ -154,6 +162,16 @@ def fetch_due(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
            FROM progress p JOIN words w ON w.id = p.word_id
            WHERE p.due_at <= ? ORDER BY p.due_at LIMIT ?""",
         (now_iso(), limit),
+    ).fetchall()
+
+
+def fetch_started(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
+    """Studied words, ordered by the nearest scheduled review."""
+    return conn.execute(
+        """SELECT w.*, p.reps, p.lapses, p.ease, p.interval_days, p.due_at
+           FROM progress p JOIN words w ON w.id = p.word_id
+           ORDER BY p.due_at LIMIT ?""",
+        (limit,),
     ).fetchall()
 
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Words Trainer Agent Tools"
+  short_description: "Use the vocabulary trainer agent tools"
+  default_prompt: "Use $words-trainer-agent-tools to run a focused German vocabulary study session."

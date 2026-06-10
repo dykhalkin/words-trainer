@@ -29,6 +29,7 @@ from vocab import db, scheduler, storage
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("WORDS_DATA", ROOT / "data"))
 TASK_TYPES = ["choice", "flashcard_de_ru", "flashcard_ru_de", "cloze", "grammar"]
+TASK_QUEUES = ["auto", "new", "learning", "review"]
 
 
 def out(data) -> None:
@@ -44,11 +45,21 @@ def cmd_sync(conn, args) -> None:
 
 
 def cmd_task(conn, args) -> None:
-    task = scheduler.create_task(conn, word_query=args.word, task_type=args.type)
+    task = scheduler.create_task(
+        conn,
+        word_query=args.word,
+        task_type=args.type,
+        queue=getattr(args, "queue", "auto"),
+    )
     if task is None:
         out({"error": "no task available", "hint": "run 'sync' first or check --word/--type"})
         sys.exit(1)
     out(task)
+
+
+def cmd_task_queue(conn, args) -> None:
+    args.queue = args.command.removeprefix("task-")
+    cmd_task(conn, args)
 
 
 def cmd_answer(conn, args) -> None:
@@ -122,6 +133,16 @@ def main() -> None:
     p = sub.add_parser("task", help="create the next exercise (JSON)")
     p.add_argument("--type", choices=TASK_TYPES, help="force a specific exercise type")
     p.add_argument("--word", help="force a specific word (lemma or substring)")
+    p.add_argument("--queue", choices=TASK_QUEUES, default="auto", help="select learning queue")
+
+    for name, help_text in (
+        ("task-new", "create a task for a never-studied word"),
+        ("task-learning", "create a task for a started non-mature word"),
+        ("task-review", "create a due review task for a mature word"),
+    ):
+        p = sub.add_parser(name, help=help_text)
+        p.add_argument("--type", choices=TASK_TYPES, help="force a specific exercise type")
+        p.add_argument("--word", help="force a specific word (lemma or substring)")
 
     p = sub.add_parser("answer", help="grade an answer for a task")
     p.add_argument("task_id")
@@ -142,6 +163,9 @@ def main() -> None:
     {
         "sync": cmd_sync,
         "task": cmd_task,
+        "task-new": cmd_task_queue,
+        "task-learning": cmd_task_queue,
+        "task-review": cmd_task_queue,
         "answer": cmd_answer,
         "due": cmd_due,
         "stats": cmd_stats,
