@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import random
 import re
-import sqlite3
+from typing import Any
 
+from psycopg import AsyncConnection
+
+from ..languages import ExerciseContext
 from ..models import Noun, VerbPrep, Word
 from .base import CheckResult, check_text, normalize, same
 
@@ -23,7 +26,12 @@ def translation_variants(translation: str) -> list[str]:
 
 class DeRu:
     @staticmethod
-    def generate(word: Word, conn: sqlite3.Connection, rng: random.Random):
+    async def generate(
+        word: Word,
+        conn: AsyncConnection[dict[str, Any]],
+        rng: random.Random,
+        context: ExerciseContext,
+    ):
         payload = {"prompt": f"Переведи на русский: «{word.lemma}»"}
         expected = {"translation": word.translation}
         return payload, expected
@@ -36,7 +44,12 @@ class DeRu:
 
 class RuDe:
     @staticmethod
-    def generate(word: Word, conn: sqlite3.Connection, rng: random.Random):
+    async def generate(
+        word: Word,
+        conn: AsyncConnection[dict[str, Any]],
+        rng: random.Random,
+        context: ExerciseContext,
+    ):
         hints = {
             "noun": " (с артиклем)",
             "verb_prep": " (с предлогом и падежом)",

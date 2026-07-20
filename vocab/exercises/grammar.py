@@ -3,22 +3,30 @@
 from __future__ import annotations
 
 import random
-import sqlite3
+from typing import Any
+
+from psycopg import AsyncConnection
 
 from .. import db
+from ..languages import ExerciseContext
 from ..models import PERSONS, Noun, Verb, VerbPrep, Word
 from .base import CheckResult, check_text
 
 TENSE_NAMES = {"praesens": "Präsens", "perfekt": "Perfekt", "praeteritum": "Präteritum"}
 
 
-def generate(word: Word, conn: sqlite3.Connection, rng: random.Random):
+async def generate(
+    word: Word,
+    conn: AsyncConnection[dict[str, Any]],
+    rng: random.Random,
+    context: ExerciseContext,
+):
     if isinstance(word, Noun):
         return _noun_task(word, rng)
     if isinstance(word, Verb):
         return _verb_task(word, rng)
     if isinstance(word, VerbPrep):
-        return _prep_task(word, conn, rng)
+        return await _prep_task(word, conn, rng, context)
     return None
 
 
@@ -49,6 +57,10 @@ def _noun_task(word: Noun, rng: random.Random):
 
 
 def _verb_task(word: Verb, rng: random.Random):
+    if set(word.conjugation) != set(TENSE_NAMES):
+        return None
+    if any(len(word.conjugation.get(tense, [])) != len(PERSONS) for tense in TENSE_NAMES):
+        return None
     tense = rng.choice(list(word.conjugation))
     person_idx = rng.randrange(len(PERSONS))
     form = word.form(tense, person_idx)
@@ -63,9 +75,21 @@ def _verb_task(word: Verb, rng: random.Random):
     return payload, expected
 
 
-def _prep_task(word: VerbPrep, conn: sqlite3.Connection, rng: random.Random):
+async def _prep_task(
+    word: VerbPrep,
+    conn: AsyncConnection[dict[str, Any]],
+    rng: random.Random,
+    context: ExerciseContext,
+):
     word_id = getattr(word, "db_id", 0)
-    others = db.sample_words(conn, "verb_prep", word_id, 12)
+    others = await db.sample_words(
+        conn,
+        user_id=context.user_id,
+        language=context.language,
+        kind="verb_prep",
+        exclude_id=word_id,
+        limit=12,
+    )
     pool = {w.rection for w in others if isinstance(w, VerbPrep)} - {word.rection}
     options = rng.sample(sorted(pool), k=min(3, len(pool))) + [word.rection]
     rng.shuffle(options)

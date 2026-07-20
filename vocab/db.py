@@ -1,263 +1,184 @@
-"""SQLite persistence: word registry, SRS progress, pending tasks, review log."""
+"""Asynchronous PostgreSQL access and migrations for the vocabulary trainer."""
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import hashlib
 import json
-import sqlite3
-from datetime import datetime, timezone
+import os
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
-from . import srs
+from psycopg import AsyncConnection
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
+
 from .models import Noun, Verb, VerbPrep, Word
 
+ROOT = Path(__file__).resolve().parents[1]
+MIGRATIONS_DIR = Path(__file__).with_name("migrations")
+DEFAULT_DATABASE_URL = "postgresql://words_trainer:words_trainer_dev@127.0.0.1:55432/words_trainer"
 WORD_CLASSES = {"noun": Noun, "verb": Verb, "verb_prep": VerbPrep, "other": Word}
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS words (
-    id          INTEGER PRIMARY KEY,
-    lemma       TEXT UNIQUE NOT NULL,
-    kind        TEXT NOT NULL,
-    source_file TEXT,
-    data        TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS progress (
-    word_id       INTEGER PRIMARY KEY REFERENCES words(id),
-    reps          INTEGER NOT NULL DEFAULT 0,
-    lapses        INTEGER NOT NULL DEFAULT 0,
-    ease          REAL    NOT NULL DEFAULT 2.5,
-    interval_days REAL    NOT NULL DEFAULT 0,
-    due_at        TEXT,
-    updated_at    TEXT
-);
-CREATE TABLE IF NOT EXISTS tasks (
-    id          TEXT PRIMARY KEY,
-    word_id     INTEGER NOT NULL REFERENCES words(id),
-    type        TEXT NOT NULL,
-    payload     TEXT NOT NULL,
-    expected    TEXT NOT NULL,
-    created_at  TEXT NOT NULL,
-    answered_at TEXT,
-    correct     INTEGER
-);
-CREATE TABLE IF NOT EXISTS reviews (
-    id        INTEGER PRIMARY KEY,
-    word_id   INTEGER NOT NULL REFERENCES words(id),
-    task_id   TEXT,
-    task_type TEXT,
-    correct   INTEGER NOT NULL,
-    quality   INTEGER NOT NULL,
-    ts        TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_progress_due ON progress(due_at);
-CREATE INDEX IF NOT EXISTS idx_reviews_word ON reviews(word_id);
-"""
+
+class DatabaseUnavailable(RuntimeError):
+    """Raised when PostgreSQL cannot become ready within the configured window."""
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+class Database:
+    """Lifecycle wrapper around a psycopg async connection pool."""
+
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        min_size: int = 1,
+        max_size: int = 6,
+        open_timeout: float = 30.0,
+    ) -> None:
+        self.dsn = dsn
+        self.open_timeout = open_timeout
+        self.pool = AsyncConnectionPool(
+            conninfo=dsn,
+            min_size=min_size,
+            max_size=max_size,
+            open=False,
+            timeout=10.0,
+            kwargs={"row_factory": dict_row},
+        )
+
+    async def open(self, *, migrate: bool = True) -> None:
+        """Open the pool with bounded non-blocking retries, then migrate."""
+        deadline = asyncio.get_running_loop().time() + self.open_timeout
+        delay = 0.25
+        last_error: Exception | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                probe = await AsyncConnection.connect(self.dsn, connect_timeout=3)
+                await probe.close()
+                break
+            except Exception as exc:  # psycopg exposes several connection errors
+                last_error = exc
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 3.0)
+        else:
+            raise DatabaseUnavailable("PostgreSQL is unavailable") from last_error
+
+        await self.pool.open()
+        try:
+            await self.pool.wait(timeout=self.open_timeout)
+            if migrate:
+                await self.migrate()
+        except Exception:
+            await self.pool.close()
+            raise
+
+    async def close(self) -> None:
+        await self.pool.close()
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[AsyncConnection[dict[str, Any]]]:
+        async with self.pool.connection() as conn:
+            yield conn
+
+    async def migrate(self) -> None:
+        """Apply every numbered SQL migration exactly once."""
+        async with self.pool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """CREATE TABLE IF NOT EXISTS schema_migrations (
+                           version TEXT PRIMARY KEY,
+                           applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                       )"""
+                )
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext('words_trainer_migrations'))"
+                )
+                result = await conn.execute("SELECT version FROM schema_migrations")
+                applied = {row["version"] for row in await result.fetchall()}
+                for path in sorted(MIGRATIONS_DIR.glob("[0-9][0-9][0-9]_*.sql")):
+                    if path.name in applied:
+                        continue
+                    await conn.execute(path.read_text(encoding="utf-8"), prepare=False)
+                    await conn.execute(
+                        "INSERT INTO schema_migrations(version) VALUES (%s)",
+                        (path.name,),
+                    )
 
 
-def connect(path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
-    return conn
+def database_url() -> str:
+    return os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
 
 
-def word_to_json(word: Word) -> str:
-    return json.dumps(dataclasses.asdict(word), ensure_ascii=False)
+def from_env(**kwargs: Any) -> Database:
+    return Database(database_url(), **kwargs)
 
 
-def word_from_row(row: sqlite3.Row) -> Word:
-    data = json.loads(row["data"])
-    cls = WORD_CLASSES.get(row["kind"], Word)
-    word = cls(**data)
-    word.db_id = row["id"]  # type: ignore[attr-defined]
+def word_to_card(word: Word) -> dict[str, Any]:
+    """Serialize a word without runtime-only attributes."""
+    return dataclasses.asdict(word)
+
+
+def canonical_card_json(card: Mapping[str, Any]) -> str:
+    return json.dumps(card, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def card_hash(card: Mapping[str, Any]) -> str:
+    return hashlib.sha256(canonical_card_json(card).encode("utf-8")).hexdigest()
+
+
+def word_from_row(row: Mapping[str, Any]) -> Word:
+    raw = row.get("card")
+    card = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+    cls = WORD_CLASSES.get(str(row.get("kind", card.get("kind", "other"))), Word)
+    allowed = {field.name for field in dataclasses.fields(cls)}
+    values = {key: value for key, value in card.items() if key in allowed}
+    word = cls(**values)
+    word.db_id = int(row["id"])  # type: ignore[attr-defined]
+    word.user_id = int(row["user_id"])  # type: ignore[attr-defined]
+    word.language = str(row["language"])  # type: ignore[attr-defined]
+    word.deck_id = int(row["deck_id"])  # type: ignore[attr-defined]
     return word
 
 
-def sync_words(conn: sqlite3.Connection, words: list[Word]) -> dict:
-    """Upsert parsed words by lemma. Words removed from CSV are kept in DB."""
-    added = updated = 0
-    for w in words:
-        data = word_to_json(w)
-        row = conn.execute("SELECT id, data FROM words WHERE lemma = ?", (w.lemma,)).fetchone()
-        if row is None:
-            conn.execute(
-                "INSERT INTO words (lemma, kind, source_file, data) VALUES (?, ?, ?, ?)",
-                (w.lemma, w.kind, w.source_file, data),
-            )
-            added += 1
-        elif row["data"] != data:
-            conn.execute(
-                "UPDATE words SET kind = ?, source_file = ?, data = ? WHERE id = ?",
-                (w.kind, w.source_file, data, row["id"]),
-            )
-            updated += 1
-    conn.commit()
-    total = conn.execute("SELECT COUNT(*) FROM words").fetchone()[0]
-    return {"added": added, "updated": updated, "total": total}
+async def fetch_one(
+    conn: AsyncConnection[dict[str, Any]], query: str, params: tuple[Any, ...] = ()
+) -> dict[str, Any] | None:
+    result = await conn.execute(query, params)
+    return await result.fetchone()
 
 
-def get_word(conn: sqlite3.Connection, word_id: int) -> Word | None:
-    row = conn.execute("SELECT * FROM words WHERE id = ?", (word_id,)).fetchone()
-    return word_from_row(row) if row else None
+async def fetch_all(
+    conn: AsyncConnection[dict[str, Any]], query: str, params: tuple[Any, ...] = ()
+) -> list[dict[str, Any]]:
+    result = await conn.execute(query, params)
+    return list(await result.fetchall())
 
 
-def find_word(conn: sqlite3.Connection, query: str) -> Word | None:
-    row = conn.execute(
-        "SELECT * FROM words WHERE lemma = ? OR lemma LIKE ? ORDER BY length(lemma) LIMIT 1",
-        (query, f"%{query}%"),
-    ).fetchone()
-    return word_from_row(row) if row else None
-
-
-def sample_words(conn: sqlite3.Connection, kind: str, exclude_id: int, n: int) -> list[Word]:
-    rows = conn.execute(
-        "SELECT * FROM words WHERE kind = ? AND id != ? ORDER BY RANDOM() LIMIT ?",
-        (kind, exclude_id, n),
-    ).fetchall()
-    return [word_from_row(r) for r in rows]
-
-
-def sample_any_words(conn: sqlite3.Connection, exclude_id: int, n: int) -> list[Word]:
-    rows = conn.execute(
-        "SELECT * FROM words WHERE id != ? ORDER BY RANDOM() LIMIT ?",
-        (exclude_id, n),
-    ).fetchall()
-    return [word_from_row(r) for r in rows]
-
-
-def get_progress(conn: sqlite3.Connection, word_id: int) -> sqlite3.Row | None:
-    return conn.execute("SELECT * FROM progress WHERE word_id = ?", (word_id,)).fetchone()
-
-
-def upsert_progress(
-    conn: sqlite3.Connection,
-    word_id: int,
+async def sample_words(
+    conn: AsyncConnection[dict[str, Any]],
     *,
-    reps: int,
-    lapses: int,
-    ease: float,
-    interval_days: float,
-    due_at: str,
-) -> None:
-    conn.execute(
-        """INSERT INTO progress (word_id, reps, lapses, ease, interval_days, due_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(word_id) DO UPDATE SET
-             reps = excluded.reps, lapses = excluded.lapses, ease = excluded.ease,
-             interval_days = excluded.interval_days, due_at = excluded.due_at,
-             updated_at = excluded.updated_at""",
-        (word_id, reps, lapses, ease, interval_days, due_at, now_iso()),
+    user_id: int,
+    language: str,
+    exclude_id: int,
+    limit: int,
+    kind: str | None = None,
+) -> list[Word]:
+    kind_clause = ""
+    params: list[Any] = [user_id, language, exclude_id]
+    if kind is not None:
+        kind_clause = " AND kind = %s"
+        params.append(kind)
+    params.append(limit)
+    rows = await fetch_all(
+        conn,
+        """SELECT * FROM words
+           WHERE user_id = %s AND language = %s AND id <> %s"""
+        + kind_clause
+        + " ORDER BY random() LIMIT %s",
+        tuple(params),
     )
-    conn.commit()
-
-
-def fetch_due(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
-    """Studied words whose review time has come, most overdue first."""
-    return conn.execute(
-        """SELECT w.*, p.reps, p.lapses, p.ease, p.interval_days, p.due_at
-           FROM progress p JOIN words w ON w.id = p.word_id
-           WHERE p.due_at <= ? ORDER BY p.due_at LIMIT ?""",
-        (now_iso(), limit),
-    ).fetchall()
-
-
-def fetch_started(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
-    """Studied words, ordered by the nearest scheduled review."""
-    return conn.execute(
-        """SELECT w.*, p.reps, p.lapses, p.ease, p.interval_days, p.due_at
-           FROM progress p JOIN words w ON w.id = p.word_id
-           ORDER BY p.due_at LIMIT ?""",
-        (limit,),
-    ).fetchall()
-
-
-def fetch_new(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
-    """Words never studied, in source order."""
-    return conn.execute(
-        """SELECT w.* FROM words w
-           LEFT JOIN progress p ON p.word_id = w.id
-           WHERE p.word_id IS NULL ORDER BY w.id LIMIT ?""",
-        (limit,),
-    ).fetchall()
-
-
-def save_task(
-    conn: sqlite3.Connection, task_id: str, word_id: int, task_type: str,
-    payload: dict, expected: dict,
-) -> None:
-    conn.execute(
-        "INSERT INTO tasks (id, word_id, type, payload, expected, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (
-            task_id, word_id, task_type,
-            json.dumps(payload, ensure_ascii=False),
-            json.dumps(expected, ensure_ascii=False),
-            now_iso(),
-        ),
-    )
-    conn.commit()
-
-
-def get_task(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row | None:
-    return conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-
-
-def close_task(conn: sqlite3.Connection, task_id: str, correct: bool) -> None:
-    conn.execute(
-        "UPDATE tasks SET answered_at = ?, correct = ? WHERE id = ?",
-        (now_iso(), int(correct), task_id),
-    )
-    conn.commit()
-
-
-def stats(conn: sqlite3.Connection) -> dict:
-    total = conn.execute("SELECT COUNT(*) FROM words").fetchone()[0]
-    studied = conn.execute("SELECT COUNT(*) FROM progress").fetchone()[0]
-    due_now = conn.execute(
-        "SELECT COUNT(*) FROM progress WHERE due_at <= ?", (now_iso(),)
-    ).fetchone()[0]
-    by_stage: dict[str, int] = {"0": 0, "1": 0, "2": 0, "3": 0}
-    for row in conn.execute("SELECT reps, interval_days FROM progress"):
-        by_stage[str(srs.stage(row["reps"], row["interval_days"]))] += 1
-    week = conn.execute(
-        """SELECT COUNT(*) AS n, COALESCE(SUM(correct), 0) AS ok
-           FROM reviews WHERE ts >= datetime('now', '-7 days')"""
-    ).fetchone()
-    hardest = conn.execute(
-        """SELECT w.lemma, w.data, p.lapses FROM progress p JOIN words w ON w.id = p.word_id
-           WHERE p.lapses > 0 ORDER BY p.lapses DESC, p.ease ASC LIMIT 10"""
-    ).fetchall()
-    return {
-        "words_total": total,
-        "words_new": total - studied,
-        "words_studied": studied,
-        "due_now": due_now,
-        "by_stage": by_stage,
-        "reviews_last_7d": {
-            "count": week["n"],
-            "correct": week["ok"],
-            "accuracy": round(week["ok"] / week["n"], 2) if week["n"] else None,
-        },
-        "hardest_words": [
-            {
-                "lemma": r["lemma"],
-                "translation": json.loads(r["data"]).get("translation", ""),
-                "lapses": r["lapses"],
-            }
-            for r in hardest
-        ],
-    }
-
-
-def record_review(
-    conn: sqlite3.Connection, word_id: int, task_id: str, task_type: str,
-    correct: bool, quality: int,
-) -> None:
-    conn.execute(
-        "INSERT INTO reviews (word_id, task_id, task_type, correct, quality, ts) VALUES (?, ?, ?, ?, ?, ?)",
-        (word_id, task_id, task_type, int(correct), quality, now_iso()),
-    )
-    conn.commit()
+    return [word_from_row(row) for row in rows]

@@ -3,21 +3,43 @@
 from __future__ import annotations
 
 import random
-import sqlite3
+from typing import Any
+
+from psycopg import AsyncConnection
 
 from .. import db
+from ..languages import ExerciseContext
 from ..models import Word
 from .base import CheckResult
 
 N_OPTIONS = 4
 
 
-def generate(word: Word, conn: sqlite3.Connection, rng: random.Random):
+async def generate(
+    word: Word,
+    conn: AsyncConnection[dict[str, Any]],
+    rng: random.Random,
+    context: ExerciseContext,
+):
     word_id = getattr(word, "db_id", 0)
-    distractors = db.sample_words(conn, word.kind, word_id, N_OPTIONS - 1)
+    distractors = await db.sample_words(
+        conn,
+        user_id=context.user_id,
+        language=context.language,
+        kind=word.kind,
+        exclude_id=word_id,
+        limit=N_OPTIONS - 1,
+    )
     if len(distractors) < N_OPTIONS - 1:  # tiny deck: take any kind
         seen = {w.lemma for w in distractors}
-        for candidate in db.sample_any_words(conn, word_id, N_OPTIONS - 1):
+        candidates = await db.sample_words(
+            conn,
+            user_id=context.user_id,
+            language=context.language,
+            exclude_id=word_id,
+            limit=N_OPTIONS * 2,
+        )
+        for candidate in candidates:
             if candidate.lemma not in seen:
                 distractors.append(candidate)
                 seen.add(candidate.lemma)
