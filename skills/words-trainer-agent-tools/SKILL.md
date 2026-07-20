@@ -14,26 +14,27 @@ description: Use when acting as or maintaining the learner-scoped AI tutor for t
   learner's confirm callback commits them.
 - CSV is import/export, not the source of truth.
 
-Run from the repository root with `uv run python cli.py`. Put global options
-before the subcommand, for example `--user spouse task`.
+Call learner-scoped Python core functions directly. Never shell out to `cli.py`
+for training: the CLI is an administrative control plane and intentionally has
+no task, answer, session, or push-delivery commands.
 
 ## Tool map
 
-| Intent | Core/agent tool | Diagnostic CLI |
-|---|---|---|
-| Next exercise | `scheduler.create_task` | `task` |
-| New / learning / review | queue argument | `task-new`, `task-learning`, `task-review` |
-| Grade once | `scheduler.submit_answer` | `answer <task_id> <answer>` |
-| Safe task context | `scheduler.task_context` | `task-context <task_id>` |
-| Word card | `words.get_word` | `word <query>` |
-| Stats/history/due | scheduler reads | `stats`, `history`, `due` |
-| Decks | words lifecycle | `deck list/create/rename/delete/move` |
-| Stage cards | `words.stage_cards` | `propose-words` |
-| Resolve cards | commit/reject | `confirm-pending`, `reject-pending` |
-| Curator plan | curator plan table | `push-plan get/set` |
+| Intent | Core/agent tool |
+|---|---|
+| Next exercise | `scheduler.create_task` |
+| New / learning / review | `create_task` queue argument |
+| Grade once | `scheduler.submit_answer` |
+| Safe task context | `scheduler.task_context` |
+| Word card | `words.get_word` |
+| Stats | `statistics.stats` |
+| Decks | `words.list_decks` |
+| Stage cards | `words.stage_cards` |
+| Resolve cards | `words.commit_pending` / `reject_pending` |
 
-Do not expose sync/import or deck mutation tools to the conversational model.
-Those are owner/admin surfaces. The tutor's only write tool is staged proposal.
+Do not expose sync/import, direct deck mutation, archive/repair administration,
+or job controls to the conversational model. Those are owner/admin surfaces.
+The tutor's only write tool is a staged proposal.
 
 ## Routing
 

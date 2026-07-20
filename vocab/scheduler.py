@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from psycopg import AsyncConnection
 from psycopg.types.json import Jsonb
 
-from . import db, srs
+from . import db, srs, statistics
 from .exercises import GENERATORS
 from .languages import ExerciseContext, language_spec, normalize_lemma
 
@@ -53,7 +53,8 @@ async def _candidate_rows(
             conn,
             """SELECT w.*, p.reps, p.lapses, p.ease, p.interval_days, p.due_at
                FROM progress p JOIN words w ON w.id = p.word_id
-               WHERE w.user_id = %s"""
+               JOIN decks d ON d.id = w.deck_id
+               WHERE w.user_id = %s AND w.card_status = 'active' AND NOT d.is_archive"""
             + deck_clause
             + due_clause
             + " ORDER BY p.due_at NULLS FIRST, w.id LIMIT %s",
@@ -69,9 +70,9 @@ async def _candidate_rows(
         params.append(limit)
         return await db.fetch_all(
             conn,
-            """SELECT w.* FROM words w
+            """SELECT w.* FROM words w JOIN decks d ON d.id = w.deck_id
                LEFT JOIN progress p ON p.word_id = w.id
-               WHERE w.user_id = %s"""
+               WHERE w.user_id = %s AND w.card_status = 'active' AND NOT d.is_archive"""
             + deck_clause
             + " AND p.word_id IS NULL ORDER BY w.id LIMIT %s",
             tuple(params),
@@ -121,8 +122,10 @@ async def _row_by_query(
         return await db.fetch_one(
             conn,
             """SELECT w.*, p.reps, p.lapses, p.ease, p.interval_days, p.due_at
-               FROM words w LEFT JOIN progress p ON p.word_id = w.id
-               WHERE w.user_id = %s AND w.id = %s""",
+               FROM words w JOIN decks d ON d.id = w.deck_id
+               LEFT JOIN progress p ON p.word_id = w.id
+               WHERE w.user_id = %s AND w.id = %s
+                 AND w.card_status = 'active' AND NOT d.is_archive""",
             (user_id, word_id),
         )
     if word_query is None:
@@ -135,8 +138,10 @@ async def _row_by_query(
     return await db.fetch_one(
         conn,
         """SELECT w.*, p.reps, p.lapses, p.ease, p.interval_days, p.due_at
-           FROM words w LEFT JOIN progress p ON p.word_id = w.id
-           WHERE w.user_id = %s AND w.lemma ILIKE %s"""
+           FROM words w JOIN decks d ON d.id = w.deck_id
+           LEFT JOIN progress p ON p.word_id = w.id
+           WHERE w.user_id = %s AND w.lemma ILIKE %s
+             AND w.card_status = 'active' AND NOT d.is_archive"""
         + language_clause
         + " ORDER BY length(w.lemma), w.id LIMIT 1",
         tuple(params),
@@ -267,7 +272,7 @@ async def submit_answer(
     async with database.connection() as conn:
         async with conn.transaction():
             result = await conn.execute(
-                """SELECT t.*, w.lemma, w.language, w.card
+                """SELECT t.*, w.lemma, w.language, w.card, w.deck_id
                    FROM tasks t JOIN words w ON w.id = t.word_id
                    WHERE t.id = %s AND t.user_id = %s FOR UPDATE OF t""",
                 (task_id, user_id),
@@ -329,11 +334,13 @@ async def submit_answer(
                 (answer, checked.correct, Jsonb(verdict), task_id),
             )
             await conn.execute(
-                """INSERT INTO reviews(user_id, word_id, task_id, task_type, answer, correct, quality)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                """INSERT INTO reviews(
+                       user_id, word_id, deck_id, task_id, task_type, answer, correct, quality
+                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
                 (
                     user_id,
                     task["word_id"],
+                    task["deck_id"],
                     task_id,
                     task["type"],
                     answer,
@@ -445,6 +452,14 @@ async def start_session(
     async with database.connection() as conn:
         async with conn.transaction():
             await conn.execute("SELECT id FROM users WHERE id = %s FOR UPDATE", (user_id,))
+            if deck_id is not None:
+                deck_result = await conn.execute(
+                    """SELECT id FROM decks
+                       WHERE id = %s AND user_id = %s AND NOT is_archive""",
+                    (deck_id, user_id),
+                )
+                if not await deck_result.fetchone():
+                    raise ValueError("session deck must be an active learner-owned deck")
             await conn.execute(
                 """UPDATE sessions SET status = 'stopped', ended_at = now()
                    WHERE user_id = %s AND status = 'open'""",
@@ -523,11 +538,13 @@ async def _due_rows_for_push(
         """SELECT w.*, p.reps, p.lapses, p.ease, p.interval_days, p.due_at,
                   lr.correct AS last_review_correct
            FROM progress p JOIN words w ON w.id = p.word_id
+           JOIN decks d ON d.id = w.deck_id
            LEFT JOIN LATERAL (
                SELECT correct FROM reviews r WHERE r.word_id = w.id
                ORDER BY r.created_at DESC LIMIT 1
            ) lr ON true
            WHERE w.user_id = %s AND p.due_at <= now()
+             AND w.card_status = 'active' AND NOT d.is_archive
            ORDER BY p.due_at, w.id LIMIT %s""",
         (user_id, limit),
     )
@@ -578,11 +595,13 @@ async def _push_rows(
                 """SELECT w.*, p.reps, p.lapses, p.ease, p.interval_days, p.due_at,
                           lr.correct AS last_review_correct
                    FROM progress p JOIN words w ON w.id = p.word_id
+                   JOIN decks d ON d.id = w.deck_id
                    LEFT JOIN LATERAL (
                        SELECT correct FROM reviews r WHERE r.word_id = w.id
                        ORDER BY r.created_at DESC LIMIT 1
                    ) lr ON true
                    WHERE w.user_id = %s AND p.due_at <= now() AND w.id = ANY(%s)
+                     AND w.card_status = 'active' AND NOT d.is_archive
                    ORDER BY array_position(%s::bigint[], w.id) LIMIT %s""",
                 (user_id, word_ids, word_ids, limit),
             )
@@ -704,42 +723,14 @@ async def history(
         )
 
 
-async def stats(database: db.Database, user_id: int) -> dict[str, Any]:
-    async with database.connection() as conn:
-        counts = await db.fetch_one(
-            conn,
-            """SELECT count(*)::int AS total,
-                      count(p.word_id)::int AS studied,
-                      count(*) FILTER (WHERE p.due_at <= now())::int AS due
-               FROM words w LEFT JOIN progress p ON p.word_id = w.id
-               WHERE w.user_id = %s""",
-            (user_id,),
-        )
-        progress_rows = await db.fetch_all(
-            conn,
-            """SELECT p.reps, p.interval_days FROM progress p
-               JOIN words w ON w.id = p.word_id WHERE w.user_id = %s""",
-            (user_id,),
-        )
-        week = await db.fetch_one(
-            conn,
-            """SELECT count(*)::int AS count,
-                      count(*) FILTER (WHERE correct)::int AS correct
-               FROM reviews WHERE user_id = %s AND created_at >= now() - interval '7 days'""",
-            (user_id,),
-        )
-    by_stage = {str(index): 0 for index in range(4)}
-    for row in progress_rows:
-        by_stage[str(_stage(row))] += 1
-    return {
-        "words_total": counts["total"],
-        "words_new": counts["total"] - counts["studied"],
-        "words_studied": counts["studied"],
-        "due_now": counts["due"],
-        "by_stage": by_stage,
-        "reviews_last_7d": {
-            "count": week["count"],
-            "correct": week["correct"],
-            "accuracy": round(week["correct"] / week["count"], 2) if week["count"] else None,
-        },
-    }
+async def stats(
+    database: db.Database,
+    user_id: int,
+    *,
+    deck_id: int | None = None,
+    days: int = 7,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    return await statistics.stats(
+        database, user_id, deck_id=deck_id, days=days, now=now
+    )

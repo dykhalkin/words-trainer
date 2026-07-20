@@ -9,7 +9,14 @@ from unittest.mock import AsyncMock
 from aiogram.types import Chat, Message, Update, User
 
 from bot.config import load_settings
-from bot.keyboards import AnswerCallback, answer_keyboard
+from bot.keyboards import (
+    AnswerCallback,
+    PracticeDeckCallback,
+    StatsDeckCallback,
+    WordActionCallback,
+    answer_keyboard,
+    deck_picker_keyboard,
+)
 from bot.middleware import LearnerMiddleware, update_chat
 from bot.presentation import session_summary, task_text, verdict_text
 
@@ -21,6 +28,38 @@ class BotPresentationTests(unittest.TestCase):
         markup = answer_keyboard("1234567890abcdef", ["sehr langes sichtbares Wort"])
         callback_data = markup.inline_keyboard[0][0].callback_data
         self.assertNotIn("sichtbares", callback_data or "")
+        typed_markup = answer_keyboard("1234567890abcdef", [])
+        self.assertEqual(len(typed_markup.inline_keyboard), 1)
+        payloads = [
+            PracticeDeckCallback(deck_id=123456789, page=99).pack(),
+            StatsDeckCallback(deck_id=123456789, page=99).pack(),
+            WordActionCallback(
+                task_id="1234567890abcdef", action="archive", confirm=1
+            ).pack(),
+        ]
+        self.assertTrue(all(len(value.encode()) <= 64 for value in payloads))
+
+    def test_archive_is_absent_from_deck_picker(self) -> None:
+        decks = [
+            {
+                "id": 1,
+                "name": "A2",
+                "language": "de",
+                "active_word_count": 3,
+                "is_archive": False,
+            },
+            {
+                "id": 2,
+                "name": "Archive",
+                "language": "de",
+                "active_word_count": 0,
+                "is_archive": True,
+            },
+        ]
+        markup = deck_picker_keyboard(decks)
+        labels = [button.text for row in markup.inline_keyboard for button in row]
+        self.assertIn("A2 (de) · 3", labels)
+        self.assertNotIn("Archive", labels)
 
     def test_rendering_for_typed_task_and_verdict(self) -> None:
         self.assertIn(

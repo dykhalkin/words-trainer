@@ -24,6 +24,8 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
                     {"version": "001_initial.sql"},
                     {"version": "002_session_ownership.sql"},
                     {"version": "003_agent_history.sql"},
+                    {"version": "004_word_disposition_and_review_deck.sql"},
+                    {"version": "005_job_control.sql"},
                 ],
             )
 

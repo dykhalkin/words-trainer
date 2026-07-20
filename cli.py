@@ -5,22 +5,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import dataclasses
 import json
 import os
-import sys
-from datetime import date
 from pathlib import Path
 from typing import Any
 
-from psycopg.types.json import Jsonb
-
-from vocab import db, scheduler, storage, words
+from vocab import db, jobs, scheduler, statistics, storage, words
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("WORDS_DATA", ROOT / "data"))
-TASK_TYPES = ["choice", "flashcard_de_ru", "flashcard_ru_de", "cloze", "grammar"]
-TASK_QUEUES = ["auto", "due", "new", "learning", "review"]
 
 
 def out(data: Any) -> None:
@@ -146,85 +139,29 @@ async def command_export(database: db.Database, args: argparse.Namespace) -> Any
     )
 
 
-async def command_task(database: db.Database, args: argparse.Namespace) -> Any:
-    user = await require_user(database, args.user)
-    deck = await resolve_deck(database, user["id"], getattr(args, "deck", None))
-    queue = getattr(args, "queue", "auto")
-    if args.command.startswith("task-"):
-        queue = args.command.removeprefix("task-")
-    task = await scheduler.create_task(
-        database,
-        user["id"],
-        word_query=getattr(args, "word", None),
-        task_type=getattr(args, "type", None),
-        queue=queue,
-        deck_id=deck["id"] if deck else None,
-        session_id=getattr(args, "session_id", None),
-    )
-    if not task:
-        raise LookupError("no task available")
-    return task
-
-
-async def command_answer(database: db.Database, args: argparse.Namespace) -> Any:
-    user = await require_user(database, args.user)
-    return await scheduler.submit_answer(database, user["id"], args.task_id, args.answer)
-
-
 async def command_word(database: db.Database, args: argparse.Namespace) -> Any:
     user = await require_user(database, args.user)
-    word = await words.get_word(database, user["id"], args.query, args.language)
+    query: int | str = int(args.query) if args.query.isdigit() else args.query
+    async with database.connection() as conn:
+        word = await db.fetch_one(
+            conn,
+            "SELECT * FROM words WHERE user_id = %s AND "
+            + ("id = %s" if isinstance(query, int) else "lemma ILIKE %s")
+            + (" AND language = %s" if args.language else "")
+            + " ORDER BY id LIMIT 1",
+            (
+                user["id"],
+                query if isinstance(query, int) else f"%{query}%",
+                *([args.language] if args.language else []),
+            ),
+        )
+        if word:
+            word["progress"] = await db.fetch_one(
+                conn, "SELECT * FROM progress WHERE word_id = %s", (word["id"],)
+            )
     if not word:
         raise LookupError(f"word not found: {args.query}")
-    result = dataclasses.asdict(word)
-    async with database.connection() as conn:
-        result["progress"] = await db.fetch_one(
-            conn, "SELECT * FROM progress WHERE word_id = %s", (word.db_id,)
-        )
-    result.update({"word_id": word.db_id, "deck_id": word.deck_id, "language": word.language})
-    return result
-
-
-async def command_session(database: db.Database, args: argparse.Namespace) -> Any:
-    user = await require_user(database, args.user)
-    if args.action == "stop":
-        return await scheduler.stop_session(database, user["id"])
-    deck = await resolve_deck(database, user["id"], args.deck)
-    return await scheduler.start_session(
-        database,
-        user["id"],
-        kind=args.kind,
-        deck_id=deck["id"] if deck else None,
-        target_count=args.target_count,
-    )
-
-
-async def command_push(database: db.Database, args: argparse.Namespace) -> Any:
-    user = await require_user(database, args.user)
-    if args.action == "compose":
-        return await scheduler.compose_push(database, user["id"], args.limit)
-    return await scheduler.claim_push(database, user["id"], limit=args.limit)
-
-
-async def command_push_plan(database: db.Database, args: argparse.Namespace) -> Any:
-    user = await require_user(database, args.user)
-    async with database.connection() as conn:
-        if args.action == "get":
-            return await db.fetch_one(
-                conn,
-                """SELECT * FROM curator_plans WHERE user_id = %s AND kind = 'plan'
-                   ORDER BY run_date DESC LIMIT 1""",
-                (user["id"],),
-            )
-        payload = json.loads(args.json)
-        result = await conn.execute(
-            """INSERT INTO curator_plans(user_id, run_date, kind, plan)
-               VALUES (%s, %s, 'plan', %s)
-               ON CONFLICT(user_id, run_date, kind) DO UPDATE
-               SET plan = EXCLUDED.plan, created_at = now() RETURNING *""",
-            (user["id"], date.today(), Jsonb(payload)),
-        )
-        return await result.fetchone()
+    return word
 
 
 async def command_pending(database: db.Database, args: argparse.Namespace) -> Any:
@@ -245,28 +182,19 @@ async def command_pending(database: db.Database, args: argparse.Namespace) -> An
     return {"rejected": await words.reject_pending(database, user["id"], args.pending_id)}
 
 
-async def command_practice(database: db.Database, args: argparse.Namespace) -> Any:
+async def command_disposition(database: db.Database, args: argparse.Namespace) -> Any:
     user = await require_user(database, args.user)
-    print("Тренировка. Пустой ввод или 'q' — выход.\n")
-    session = await scheduler.start_session(database, user["id"], kind="long")
-    while True:
-        task = await scheduler.create_task(database, user["id"], session_id=session["id"])
-        if not task:
-            print("Сейчас больше нечего изучать.")
-            break
-        print(f"[{task['type']}] {task['prompt']}")
-        for index, option in enumerate(task.get("options", []), 1):
-            print(f"  {index}. {option}")
-        if task.get("hint"):
-            print(f"  подсказка: {task['hint']}")
-        answer = (await asyncio.to_thread(input, "> ")).strip()
-        if not answer or answer.lower() in {"q", "quit", "exit"}:
-            break
-        result = await scheduler.submit_answer(database, user["id"], task["task_id"], answer)
-        mark = "✅" if result["correct"] else "❌"
-        note = f" — {result['note']}" if result.get("note") else ""
-        print(f"{mark} {result['expected']}{note}\n")
-    return await scheduler.stop_session(database, user["id"])
+    query: int | str = int(args.word) if args.word.isdigit() else args.word
+    if args.command == "word-archive":
+        return await words.archive_word(database, user["id"], query)
+    if args.command == "word-flag":
+        return await words.flag_word(database, user["id"], query, reason=args.reason)
+    if args.command == "word-restore":
+        deck = await resolve_deck(database, user["id"], args.deck)
+        return await words.restore_word(database, user["id"], query, deck["id"])
+    return await words.replace_word_card(
+        database, user["id"], int(args.word), json.loads(args.card_json)
+    )
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -276,6 +204,10 @@ async def run(args: argparse.Namespace) -> int:
         if args.command == "migrate":
             await database.migrate()
             result: Any = {"migrated": True}
+        elif args.command == "health":
+            async with database.connection() as conn:
+                row = await db.fetch_one(conn, "SELECT current_database() AS database, now() AS now")
+            result = {"ok": True, **row}
         elif args.command == "user":
             result = await command_user(database, args)
         elif args.command == "deck":
@@ -286,27 +218,31 @@ async def run(args: argparse.Namespace) -> int:
             result = await command_sync(database, args)
         elif args.command == "export":
             result = await command_export(database, args)
-        elif args.command in {"task", "task-new", "task-learning", "task-review"}:
-            result = await command_task(database, args)
-        elif args.command == "answer":
-            result = await command_answer(database, args)
-        elif args.command == "due":
-            user = await require_user(database, args.user)
-            due = await scheduler.list_due(database, user["id"], args.limit)
-            result = {
-                "due": [
-                    {key: row[key] for key in ("id", "lemma", "kind", "language", "due_at", "reps")}
-                    for row in due
-                ]
-            }
         elif args.command == "stats":
             user = await require_user(database, args.user)
-            result = await scheduler.stats(database, user["id"])
+            deck = await resolve_deck(database, user["id"], args.deck)
+            result = await statistics.stats(
+                database,
+                user["id"],
+                deck_id=deck["id"] if deck else None,
+                days=args.days,
+            )
         elif args.command == "word":
             result = await command_word(database, args)
-        elif args.command == "task-context":
+        elif args.command in {"word-archive", "word-restore", "word-flag", "word-fix"}:
+            result = await command_disposition(database, args)
+        elif args.command == "issues":
             user = await require_user(database, args.user)
-            result = await scheduler.task_context(database, user["id"], args.task_id)
+            deck = await resolve_deck(database, user["id"], args.deck)
+            result = {
+                "issues": await words.list_word_issues(
+                    database,
+                    user["id"],
+                    deck_id=deck["id"] if deck else None,
+                    limit=args.limit,
+                    offset=args.offset,
+                )
+            }
         elif args.command == "history":
             user = await require_user(database, args.user)
             word_id = None
@@ -320,33 +256,26 @@ async def run(args: argparse.Namespace) -> int:
                     database, user["id"], word_id=word_id, limit=args.limit
                 )
             }
-        elif args.command == "curator-run":
-            user = await require_user(database, args.user)
-            from vocab import curator as curator_core
-
-            if args.dry_run:
-                result = await curator_core.analyze(database, user["id"])
+        elif args.command == "job":
+            if args.action == "list":
+                result = {"jobs": await jobs.list_jobs(database)}
+            elif args.action == "runs":
+                result = {
+                    "runs": await jobs.list_runs(
+                        database, job_name=args.name, limit=args.limit
+                    )
+                }
+            elif args.action == "run":
+                result = await jobs.enqueue_run(database, args.name, force=args.force)
             else:
-                from bot.config import load_settings
-                from bot.curator import CuratorService
-
-                result = await CuratorService(load_settings()).run_for(
-                    database, user, kind=args.kind
+                result = await jobs.set_enabled(
+                    database, args.name, args.action == "enable"
                 )
-        elif args.command == "session":
-            result = await command_session(database, args)
-        elif args.command == "push":
-            result = await command_push(database, args)
-        elif args.command == "push-plan":
-            result = await command_push_plan(database, args)
         elif args.command in {"propose-words", "confirm-pending", "reject-pending"}:
             result = await command_pending(database, args)
-        elif args.command == "practice":
-            result = await command_practice(database, args)
         else:
             raise ValueError(f"unsupported command: {args.command}")
-        if args.command != "practice":
-            out(result)
+        out(result)
         return 0
     except Exception as exc:
         out({"error": str(exc), "type": type(exc).__name__})
@@ -361,6 +290,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--user", default="owner")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("migrate")
+    sub.add_parser("health")
 
     user = sub.add_parser("user")
     user_sub = user.add_subparsers(dest="action", required=True)
@@ -402,55 +332,42 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("deck")
     export.add_argument("path")
 
-    task = sub.add_parser("task")
-    task.add_argument("--type", choices=TASK_TYPES)
-    task.add_argument("--word")
-    task.add_argument("--queue", choices=TASK_QUEUES, default="auto")
-    task.add_argument("--deck")
-    task.add_argument("--session-id")
-    for name in ("task-new", "task-learning", "task-review"):
-        queue_parser = sub.add_parser(name)
-        queue_parser.add_argument("--type", choices=TASK_TYPES)
-        queue_parser.add_argument("--word")
-        queue_parser.add_argument("--deck")
-        queue_parser.add_argument("--session-id")
-    answer = sub.add_parser("answer")
-    answer.add_argument("task_id")
-    answer.add_argument("answer")
-    due = sub.add_parser("due")
-    due.add_argument("--limit", type=int, default=20)
-    sub.add_parser("stats")
+    stats = sub.add_parser("stats")
+    stats.add_argument("--deck")
+    stats.add_argument("--days", type=int, default=7)
     word = sub.add_parser("word")
     word.add_argument("query")
     word.add_argument("--language")
-    task_context = sub.add_parser("task-context")
-    task_context.add_argument("task_id")
+    archive = sub.add_parser("word-archive")
+    archive.add_argument("word")
+    restore = sub.add_parser("word-restore")
+    restore.add_argument("word")
+    restore.add_argument("--deck", required=True)
+    flag = sub.add_parser("word-flag")
+    flag.add_argument("word")
+    flag.add_argument("--reason")
+    fix = sub.add_parser("word-fix")
+    fix.add_argument("word")
+    fix.add_argument("--card-json", required=True)
+    issues = sub.add_parser("issues")
+    issues.add_argument("--deck")
+    issues.add_argument("--limit", type=int, default=100)
+    issues.add_argument("--offset", type=int, default=0)
     history = sub.add_parser("history")
     history.add_argument("--limit", type=int, default=100)
     history.add_argument("--word")
-    curator_run = sub.add_parser("curator-run")
-    curator_run.add_argument("--kind", choices=["plan", "digest"], default="plan")
-    curator_run.add_argument("--dry-run", action="store_true")
-
-    session = sub.add_parser("session")
-    session_sub = session.add_subparsers(dest="action", required=True)
-    start = session_sub.add_parser("start")
-    start.add_argument("--kind", choices=["micro", "long"], default="long")
-    start.add_argument("--deck")
-    start.add_argument("--target-count", type=int)
-    session_sub.add_parser("stop")
-
-    push = sub.add_parser("push")
-    push_sub = push.add_subparsers(dest="action", required=True)
-    for action in ("compose", "claim"):
-        item = push_sub.add_parser(action)
-        item.add_argument("--limit", type=int, default=5)
-
-    push_plan = sub.add_parser("push-plan")
-    push_plan_sub = push_plan.add_subparsers(dest="action", required=True)
-    push_plan_sub.add_parser("get")
-    set_plan = push_plan_sub.add_parser("set")
-    set_plan.add_argument("json")
+    job = sub.add_parser("job")
+    job_sub = job.add_subparsers(dest="action", required=True)
+    job_sub.add_parser("list")
+    for action in ("enable", "disable"):
+        item = job_sub.add_parser(action)
+        item.add_argument("name", choices=jobs.JOB_NAMES)
+    run_job = job_sub.add_parser("run")
+    run_job.add_argument("name", choices=jobs.JOB_NAMES)
+    run_job.add_argument("--force", action="store_true")
+    runs = job_sub.add_parser("runs")
+    runs.add_argument("--name", choices=jobs.JOB_NAMES)
+    runs.add_argument("--limit", type=int, default=50)
 
     propose = sub.add_parser("propose-words")
     propose.add_argument("--language", default="de")
@@ -461,7 +378,6 @@ def build_parser() -> argparse.ArgumentParser:
     confirm.add_argument("--move-existing", action="store_true")
     reject = sub.add_parser("reject-pending")
     reject.add_argument("pending_id")
-    sub.add_parser("practice")
     return parser
 
 

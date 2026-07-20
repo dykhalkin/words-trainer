@@ -18,7 +18,7 @@ from psycopg.types.json import Jsonb
 from . import db
 from .languages import normalize_deck_name, normalize_lemma, normalize_spaces, validate_word
 from .models import TENSES, Noun, Verb, VerbPrep, Word
-from .words import _ensure_general_deck, _find_deck, _insert_or_reuse_word
+from .words import RESERVED_DECK_NAMES, _ensure_general_deck, _find_deck, _insert_or_reuse_word
 
 NOUN_RE = re.compile(r"^(der|die|das)\s+(.+?)\s*(?:\((.+?)\))?$", re.IGNORECASE)
 PREP_RE = re.compile(r"^(.+?)\s+\+\s*(\w+)$")
@@ -110,6 +110,8 @@ async def import_csv(
     deck_name: str,
     language: str,
 ) -> dict[str, Any]:
+    if normalize_deck_name(deck_name) in RESERVED_DECK_NAMES:
+        raise ValueError("General and Archive are reserved deck names")
     parsed = load_file(path)
     summary: dict[str, Any] = {
         "file": path.name,
@@ -137,6 +139,8 @@ async def import_csv(
                     ),
                 )
                 deck = await result.fetchone()
+            if deck["is_archive"]:
+                raise ValueError("cannot import into the archive deck")
 
             for word in parsed:
                 validate_word(word, language, strict_agent=False)
@@ -202,7 +206,10 @@ async def import_csv(
                     continue
                 await conn.execute(
                     """UPDATE words
-                       SET lemma = %s, lemma_key = %s, kind = %s, card = %s, modified_at = now()
+                       SET lemma = %s, lemma_key = %s, kind = %s, card = %s,
+                           card_status = 'active', needs_fix_at = NULL,
+                           needs_fix_reason = NULL, needs_fix_task_id = NULL,
+                           modified_at = now()
                        WHERE id = %s""",
                     (word.lemma, key, word.kind, Jsonb(incoming_card), existing["id"]),
                 )
@@ -211,6 +218,14 @@ async def import_csv(
                        SET imported_card_hash = %s, imported_at = now() WHERE word_id = %s""",
                     (incoming_hash, existing["id"]),
                 )
+                if existing["card_status"] == "needs_fix":
+                    await conn.execute(
+                        """UPDATE progress
+                           SET due_at = LEAST(COALESCE(due_at, now()), now()),
+                               updated_at = now()
+                           WHERE word_id = %s""",
+                        (existing["id"],),
+                    )
                 summary["updated"] += 1
             summary["deck_id"] = deck["id"]
     summary["conflict_count"] = len(summary["conflicts"])

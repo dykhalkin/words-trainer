@@ -133,11 +133,19 @@ class CuratorService:
             return None
 
 
-async def run_curator_cycle(
-    service: CuratorService, bot: Bot, database: db.Database
-) -> None:
+async def run_plan_cycle(service: CuratorService, database: db.Database) -> int:
+    completed = 0
     for learner in await words.list_users(database):
-        await service.run_for(database, learner)
+        if await service.run_for(database, learner):
+            completed += 1
+    return completed
+
+
+async def run_digest_cycle(
+    service: CuratorService, bot: Bot, database: db.Database
+) -> int:
+    sent = 0
+    for learner in await words.list_users(database):
         run_date = await curator.local_run_date(database, learner["id"])
         if run_date.weekday() != 0:
             continue
@@ -159,3 +167,5 @@ async def run_curator_cycle(
             await scheduler.mark_delivery_failed(database, delivery["id"], str(exc))
         else:
             await scheduler.mark_delivery_sent(database, delivery["id"], message.message_id)
+            sent += 1
+    return sent

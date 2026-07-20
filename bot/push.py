@@ -14,7 +14,8 @@ from .keyboards import start_keyboard
 logger = logging.getLogger(__name__)
 
 
-async def run_push_cycle(bot: Bot, database: db.Database) -> None:
+async def run_push_cycle(bot: Bot, database: db.Database) -> int:
+    sent = 0
     for learner in await words.list_users(database):
         delivery = await scheduler.claim_push(database, learner["id"])
         if not delivery:
@@ -32,3 +33,5 @@ async def run_push_cycle(bot: Bot, database: db.Database) -> None:
             await scheduler.mark_delivery_failed(database, delivery["id"], str(exc))
         else:
             await scheduler.mark_delivery_sent(database, delivery["id"], message.message_id)
+            sent += 1
+    return sent

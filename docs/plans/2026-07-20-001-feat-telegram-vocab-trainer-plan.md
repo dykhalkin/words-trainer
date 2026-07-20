@@ -12,6 +12,8 @@ deepened: 2026-07-20
 
 # Telegram Vocabulary Trainer Bot - Plan
 
+> **Architecture supersession (2026-07-21):** KTD10 and the training/tool-parity portion of U5 are superseded by [Deck-scoped Practice, Word Disposition, and Deck Statistics](2026-07-21-001-feat-deck-practice-word-disposition-deck-stats-plan.md). The CLI becomes a manager-only control plane; Telegram and agent adapters call core functions directly, and background jobs are controlled through PostgreSQL-backed requests executed by the bot process.
+
 ## Goal Capsule
 
 - **Objective:** turn the existing German vocabulary trainer core (`vocab/`, `cli.py`) into a family Telegram bot (owner + spouse) with three learning modes and an AI agent, running 24/7 on the owner's Mac mini with PostgreSQL storage.

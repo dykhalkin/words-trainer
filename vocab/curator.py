@@ -25,8 +25,9 @@ async def analyze(database: db.Database, user_id: int) -> dict[str, Any]:
                       count(r.id)::int AS reviews,
                       count(r.id) FILTER (WHERE NOT r.correct)::int AS errors,
                       round(avg(r.quality), 2) AS average_quality
-               FROM words w JOIN reviews r ON r.word_id = w.id
-               WHERE w.user_id = %s
+               FROM words w JOIN decks d ON d.id = w.deck_id
+               JOIN reviews r ON r.word_id = w.id
+               WHERE w.user_id = %s AND w.card_status = 'active' AND NOT d.is_archive
                GROUP BY w.id
                ORDER BY count(r.id) FILTER (WHERE NOT r.correct) DESC,
                         avg(r.quality), w.id
@@ -37,7 +38,10 @@ async def analyze(database: db.Database, user_id: int) -> dict[str, Any]:
             conn,
             """SELECT task_type, count(*)::int AS reviews,
                       count(*) FILTER (WHERE correct)::int AS correct
-               FROM reviews WHERE user_id = %s AND created_at >= now() - interval '30 days'
+               FROM reviews r JOIN words w ON w.id = r.word_id
+               JOIN decks d ON d.id = w.deck_id
+               WHERE r.user_id = %s AND r.created_at >= now() - interval '30 days'
+                 AND w.card_status = 'active' AND NOT d.is_archive
                GROUP BY task_type ORDER BY task_type""",
             (user_id,),
         )
@@ -49,13 +53,17 @@ async def analyze(database: db.Database, user_id: int) -> dict[str, Any]:
                                       AND p.due_at > now() - interval '7 days')::int AS days_1_7,
                    count(*) FILTER (WHERE p.due_at <= now() - interval '7 days')::int AS over_7d
                FROM progress p JOIN words w ON w.id = p.word_id
-               WHERE w.user_id = %s AND p.due_at <= now()""",
+               JOIN decks d ON d.id = w.deck_id
+               WHERE w.user_id = %s AND p.due_at <= now()
+                 AND w.card_status = 'active' AND NOT d.is_archive""",
             (user_id,),
         )
         recent = await db.fetch_all(
             conn,
-            """SELECT word_id, correct FROM reviews WHERE user_id = %s
-               ORDER BY created_at DESC LIMIT 50""",
+            """SELECT r.word_id, r.correct FROM reviews r
+               JOIN words w ON w.id = r.word_id JOIN decks d ON d.id = w.deck_id
+               WHERE r.user_id = %s AND w.card_status = 'active' AND NOT d.is_archive
+               ORDER BY r.created_at DESC LIMIT 50""",
             (user_id,),
         )
     streaks: dict[int, int] = {}

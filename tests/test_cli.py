@@ -11,7 +11,7 @@ import cli
 from tests.support import temporary_database
 
 
-class CliParityTests(unittest.IsolatedAsyncioTestCase):
+class CliManagerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.context = temporary_database()
         self.database = await self.context.__aenter__()
@@ -52,30 +52,45 @@ class CliParityTests(unittest.IsolatedAsyncioTestCase):
         renamed = await self.invoke("deck", "rename", str(created["id"]), "CLI renamed")
         self.assertEqual(renamed["name"], "CLI renamed")
 
-        task = await self.invoke("task-new", "--deck", str(source_deck["id"]))
-        context = await self.invoke("task-context", task["task_id"])
-        self.assertNotIn("expected", context)
-        await self.invoke("answer", task["task_id"], "intentionally wrong")
-        answered_context = await self.invoke("task-context", task["task_id"])
-        self.assertIn("expected", answered_context)
-        await self.invoke("word", task["word"])
+        async with self.database.connection() as conn:
+            row = await conn.execute(
+                "SELECT id, card FROM words WHERE user_id = %s ORDER BY id LIMIT 1",
+                (bootstrapped["users"][0]["id"],),
+            )
+            selected = await row.fetchone()
+        found = await self.invoke("word", str(selected["id"]))
+        self.assertEqual(found["id"], selected["id"])
         await self.invoke("history", "--limit", "5")
-        await self.invoke("history", "--word", task["word"], "--limit", "5")
-        analysis = await self.invoke("curator-run", "--dry-run")
-        self.assertEqual(analysis["user_id"], bootstrapped["users"][0]["id"])
-        await self.invoke("due")
-        await self.invoke("stats")
+        await self.invoke("history", "--word", found["lemma"], "--limit", "5")
+        stats = await self.invoke("stats", "--deck", str(source_deck["id"]))
+        self.assertEqual(stats["deck"]["id"], source_deck["id"])
 
-        session = await self.invoke(
-            "session", "start", "--kind", "micro", "--deck", str(source_deck["id"]),
-            "--target-count", "3"
+        await self.invoke("word-flag", str(selected["id"]), "--reason", "typo")
+        issues = await self.invoke("issues")
+        self.assertEqual(issues["issues"][0]["word_id"], selected["id"])
+        card = dict(selected["card"])
+        card.pop("source_file", None)
+        await self.invoke(
+            "word-fix", str(selected["id"]), "--card-json", json.dumps(card)
         )
-        self.assertEqual(session["target_count"], 3)
-        await self.invoke("session", "stop")
-        await self.invoke("push", "compose")
-        await self.invoke("push", "claim")
-        await self.invoke("push-plan", "set", '{"word_ids": []}')
-        await self.invoke("push-plan", "get")
+        self.assertEqual((await self.invoke("issues"))["issues"], [])
+        archived = await self.invoke("word-archive", str(selected["id"]))
+        await self.invoke(
+            "word-restore", str(selected["id"]), "--deck", str(source_deck["id"])
+        )
+        self.assertNotEqual(archived["deck_id"], source_deck["id"])
+
+        job_list = await self.invoke("job", "list")
+        self.assertEqual(len(job_list["jobs"]), 5)
+        await self.invoke("job", "disable", "push")
+        rejected = await self.invoke("job", "run", "push", succeeds=False)
+        self.assertIn("disabled", rejected["error"])
+        queued = await self.invoke("job", "run", "push", "--force")
+        self.assertEqual(queued["status"], "queued")
+        runs = await self.invoke("job", "runs", "--name", "push")
+        self.assertEqual(runs["runs"][0]["id"], queued["id"])
+        await self.invoke("job", "enable", "push")
+        self.assertTrue((await self.invoke("health"))["ok"])
 
         staged = await self.invoke(
             "propose-words",
@@ -100,6 +115,22 @@ class CliParityTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(exported.exists())
 
         await self.invoke("deck", "delete", str(created["id"]))
+
+    def test_training_commands_are_absent_from_parser(self) -> None:
+        parser = cli.build_parser()
+        for command in (
+            "task",
+            "task-new",
+            "answer",
+            "task-context",
+            "session",
+            "practice",
+            "push",
+            "push-plan",
+            "curator-run",
+        ):
+            with self.subTest(command=command), self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                parser.parse_args([command])
 
 
 if __name__ == "__main__":

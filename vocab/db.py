@@ -175,8 +175,9 @@ async def sample_words(
     params.append(limit)
     rows = await fetch_all(
         conn,
-        """SELECT * FROM words
-           WHERE user_id = %s AND language = %s AND id <> %s"""
+        """SELECT w.* FROM words w JOIN decks d ON d.id = w.deck_id
+           WHERE w.user_id = %s AND w.language = %s AND w.id <> %s
+             AND w.card_status = 'active' AND NOT d.is_archive"""
         + kind_clause
         + " ORDER BY random() LIMIT %s",
         tuple(params),

@@ -58,6 +58,21 @@ class ImportExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["added"], 1)
         self.assertEqual(second["unchanged"], 1)
 
+        await words.flag_word(
+            self.database, self.owner["id"], word.db_id, reason="check import repair"
+        )
+        unchanged_flagged = await storage.import_csv(
+            self.database,
+            path,
+            user_id=self.owner["id"],
+            deck_name="Basic",
+            language="de",
+        )
+        self.assertEqual(unchanged_flagged["unchanged"], 1)
+        self.assertEqual(
+            len(await words.list_word_issues(self.database, self.owner["id"])), 1
+        )
+
         write_csv(path, [["gehen", "ходить", "Ich gehe nach Hause.", "ge-en"]])
         updated = await storage.import_csv(
             self.database,
@@ -67,8 +82,17 @@ class ImportExportTests(unittest.IsolatedAsyncioTestCase):
             language="de",
         )
         self.assertEqual(updated["updated"], 1)
+        self.assertEqual(
+            await words.list_word_issues(self.database, self.owner["id"]), []
+        )
         async with self.database.connection() as conn:
-            row = await db.fetch_one(conn, "SELECT card FROM words WHERE id = %s", (word.db_id,))
+            row = await db.fetch_one(
+                conn,
+                """SELECT w.card, p.due_at, now() AS database_now
+                   FROM words w JOIN progress p ON p.word_id = w.id WHERE w.id = %s""",
+                (word.db_id,),
+            )
+            self.assertLessEqual(row["due_at"], row["database_now"])
             card = dict(row["card"])
             card["translation"] = "идти пешком (ручная правка)"
             await conn.execute(
