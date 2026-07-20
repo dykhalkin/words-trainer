@@ -1,73 +1,48 @@
 ---
 name: words-trainer-agent-tools
-description: Use when acting as the AI study agent for this words-trainer repository, especially for Telegram/chat vocabulary sessions, tool-calling wrappers around cli.py, selecting between new-word learning, continued learning, mature review, answer submission, progress analysis, or word explanations. Use when the user asks to study German words, get the next exercise, submit an answer, inspect progress, explain a word, or design/maintain agent_tools for the vocabulary trainer.
+description: Use when acting as or maintaining the learner-scoped AI tutor for this PostgreSQL Telegram vocabulary trainer.
 ---
 
 # Words Trainer Agent Tools
 
-## Core Rule
+## Invariants
 
-Use the deterministic trainer tools for state and grading. Do not invent whether an answer is correct when a task was issued by the trainer; call the answer tool and explain the returned result.
+- The deterministic scheduler alone grades answers and writes progress/reviews.
+- Every call is scoped to the resolved learner; never accept a model-supplied user ID.
+- An unanswered `task-context` must not contain `expected`.
+- AI-created cards are strict `WordCard` proposals in `pending_cards`; only the
+  learner's confirm callback commits them.
+- CSV is import/export, not the source of truth.
 
-Run commands from the repository root. Prefer `python3 -B cli.py ...` to avoid bytecode writes.
+Run from the repository root with `uv run python cli.py`. Put global options
+before the subcommand, for example `--user spouse task`.
 
-## Tool Map
+## Tool map
 
-Use these as the canonical agent tools. If a wrapper module named `agent_tools` exists, map each wrapper to the corresponding CLI command and preserve the same semantics.
-
-| Agent intent | Tool name | CLI command |
+| Intent | Core/agent tool | Diagnostic CLI |
 |---|---|---|
-| Auto next task | `get_next_task()` | `python3 -B cli.py task` |
-| Learn a new word | `learn_new_word()` | `python3 -B cli.py task-new` |
-| Continue started words | `continue_learning()` | `python3 -B cli.py task-learning` |
-| Review mature words | `review_learned_word()` | `python3 -B cli.py task-review` |
-| Submit answer | `submit_answer(task_id, answer)` | `python3 -B cli.py answer <task_id> "<answer>"` |
-| Stats | `get_stats()` | `python3 -B cli.py stats` |
-| Word card | `get_word_card(query)` | `python3 -B cli.py word "<query>"` |
-| Due queue | `list_due(limit=20)` | `python3 -B cli.py due --limit <n>` |
-| Sync CSV | `sync_words()` | `python3 -B cli.py sync` |
+| Next exercise | `scheduler.create_task` | `task` |
+| New / learning / review | queue argument | `task-new`, `task-learning`, `task-review` |
+| Grade once | `scheduler.submit_answer` | `answer <task_id> <answer>` |
+| Safe task context | `scheduler.task_context` | `task-context <task_id>` |
+| Word card | `words.get_word` | `word <query>` |
+| Stats/history/due | scheduler reads | `stats`, `history`, `due` |
+| Decks | words lifecycle | `deck list/create/rename/delete/move` |
+| Stage cards | `words.stage_cards` | `propose-words` |
+| Resolve cards | commit/reject | `confirm-pending`, `reject-pending` |
+| Curator plan | curator plan table | `push-plan get/set` |
 
-## Queue Semantics
+Do not expose sync/import or deck mutation tools to the conversational model.
+Those are owner/admin surfaces. The tutor's only write tool is staged proposal.
 
-Choose the queue from the user's learning intent:
+## Routing
 
-- `task-new`: introduce completely new words with no progress.
-- `task-learning`: continue learning started non-mature words; use this when the user wants to strengthen current material without adding new words.
-- `task-review`: repeat mature words that are due; use this for maintenance/review sessions.
-- `task`: auto mode; use when the user says "next", "practice", or gives no preference.
+Telegram routes command → callback → persisted pending typed task → tutor chat.
+For an issued task show prompt/options/hint only, preserve its exact ID, call
+`submit_answer` once, then explain the returned verdict without overriding it.
 
-If a queue returns `no task available`, say that queue is empty and offer the nearest useful alternative: new words for empty learning/review queues, or stats/due inspection if the user wants planning.
+## Failure behavior
 
-## Session Workflow
-
-1. Start with `sync_words()` only when the user added or edited CSV files, or when the database may be stale.
-2. Select the task tool from the user's intent. Keep the returned `task_id`.
-3. Present only the user-facing task fields: prompt, options, hint. Do not expose internal expected data.
-4. On the user's answer, call `submit_answer(task_id, answer)` exactly once.
-5. Explain the returned verdict briefly. Use `expected`, `note`, `translation`, `stage`, and `next_review_at`.
-6. Continue with the same queue unless the user changes mode.
-
-## Explanation Workflow
-
-For "explain this word" or after a wrong answer:
-
-1. Call `get_word_card(query)` for lemma, translation, example, pronunciation, grammar fields, and progress.
-2. Explain the specific issue using the word card and the trainer result.
-3. Keep grading anchored to `submit_answer`; use the explanation to teach, not to override the database.
-
-## Tool Design Rules
-
-When creating or editing `agent_tools`:
-
-- Keep tools thin: parse arguments, invoke the trainer command or scheduler/db functions, return JSON-safe dicts.
-- Preserve one-shot task semantics: issued tasks are answered once; repeated answers should surface the trainer error.
-- Keep queue tools separate instead of adding a vague `mode` argument to one public tool.
-- Preserve exact task IDs and answer strings.
-- Do not let an LLM mark answers correct independently of `submit_answer`.
-- Return trainer errors unchanged enough for the chat agent to explain them.
-
-## Safety Notes
-
-`task*` commands create rows in `tasks`. In tests or diagnostics, use a temporary database via `--db /private/tmp/.../progress.sqlite3` or clean up diagnostic tasks explicitly.
-
-Do not modify the user's real `progress.sqlite3` unless the request is an actual study action or a requested migration.
+OpenAI failures or budget exhaustion disable chat, explanations, and curator
+generation only. Deterministic drills, grading, sessions, and fallback push
+composition continue to work.

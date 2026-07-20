@@ -1,7 +1,7 @@
 """Exercise generators and answer checkers.
 
 Each module exposes:
-    generate(word, conn, rng) -> (payload, expected) | None   # None = not applicable
+    await generate(word, conn, rng, context) -> (payload, expected) | None
     check(expected, answer)   -> CheckResult
 
 payload  — what the user sees (prompt, options, ...), JSON-safe
@@ -10,6 +10,7 @@ expected — internal data needed to grade the answer, JSON-safe
 
 from . import choice, cloze, flashcard, grammar
 from .base import CheckResult
+from ..languages import ExerciseContext
 
 GENERATORS = {
     "choice": choice,
@@ -19,4 +20,4 @@ GENERATORS = {
     "grammar": grammar,
 }
 
-__all__ = ["GENERATORS", "CheckResult"]
+__all__ = ["GENERATORS", "CheckResult", "ExerciseContext"]

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.wordsbot.bot</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/misha/work/words-trainer/.venv/bin/python</string>
+    <string>-m</string><string>bot</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/misha/work/words-trainer</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>WORDSBOT_ENV_FILE</key><string>/Users/misha/.config/wordsbot/env</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>/Users/misha/Library/Logs/wordsbot/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/misha/Library/Logs/wordsbot/launchd.err.log</string>
+</dict>
+</plist>

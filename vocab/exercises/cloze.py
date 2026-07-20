@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import random
 import re
-import sqlite3
+from typing import Any
 
+from psycopg import AsyncConnection
+
+from ..languages import ExerciseContext
 from ..models import Noun, Verb, Word
 from .base import CheckResult, check_text, fold_umlauts
 
@@ -76,7 +79,12 @@ def find_blank(word: Word) -> str | None:
     return None
 
 
-def generate(word: Word, conn: sqlite3.Connection, rng: random.Random):
+async def generate(
+    word: Word,
+    conn: AsyncConnection[dict[str, Any]],
+    rng: random.Random,
+    context: ExerciseContext,
+):
     if not word.example:
         return None
     target = find_blank(word)
