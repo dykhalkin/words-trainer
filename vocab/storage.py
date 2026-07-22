@@ -16,7 +16,13 @@ from typing import Any
 from psycopg.types.json import Jsonb
 
 from . import db
-from .languages import normalize_deck_name, normalize_lemma, normalize_spaces, validate_word
+from .languages import (
+    normalize_deck_name,
+    normalize_language_code,
+    normalize_lemma,
+    normalize_spaces,
+    validate_word,
+)
 from .models import TENSES, Noun, Verb, VerbPrep, Word
 from .words import RESERVED_DECK_NAMES, _ensure_general_deck, _find_deck, _insert_or_reuse_word
 
@@ -110,6 +116,7 @@ async def import_csv(
     deck_name: str,
     language: str,
 ) -> dict[str, Any]:
+    language = normalize_language_code(language)
     if normalize_deck_name(deck_name) in RESERVED_DECK_NAMES:
         raise ValueError("General and Archive are reserved deck names")
     parsed = load_file(path)

@@ -13,7 +13,9 @@ from vocab import db, llm, scheduler, words
 
 from .agent import TutorService
 from .drill import finish_answer
+from .grader import TutorGraderService
 from .keyboards import ExplainCallback, PendingCallback, pending_keyboard
+from .reminders import handle_pending_text
 
 logger = logging.getLogger(__name__)
 router = Router(name="chat")
@@ -65,12 +67,21 @@ async def text_answer_or_chat(
     database: db.Database,
     learner: dict[str, Any],
     tutor: TutorService,
+    grader: TutorGraderService,
 ) -> None:
     task = await scheduler.get_open_task(database, learner["id"])
     if task:
         await finish_answer(
-            message, database, learner, task["task_id"], message.text or "", edit=False
+            message,
+            database,
+            learner,
+            task["task_id"],
+            message.text or "",
+            edit=False,
+            grader=grader,
         )
+        return
+    if await handle_pending_text(message, database, learner):
         return
     await send_tutor_reply(message, database, learner, tutor, message.text or "")
 

@@ -22,25 +22,44 @@ class ExerciseContext:
 @dataclass(frozen=True)
 class LanguageSpec:
     code: str
+    prompt_name_ru: str
     exercise_types: tuple[str, ...]
 
 
 GERMAN = LanguageSpec(
     code="de",
-    exercise_types=("choice", "flashcard_de_ru", "flashcard_ru_de", "cloze", "grammar"),
+    prompt_name_ru="по-немецки",
+    exercise_types=("choice", "flashcard_ru_de", "cloze", "grammar"),
 )
 FALLBACK = LanguageSpec(
     code="*",
-    exercise_types=("choice", "flashcard_de_ru", "flashcard_ru_de"),
+    prompt_name_ru="на изучаемом языке",
+    exercise_types=("choice", "flashcard_ru_de"),
 )
 REGISTRY = {"de": GERMAN}
+
+LANGUAGE_ALIASES = {
+    "de": "de",
+    "deutsch": "de",
+    "german": "de",
+}
 
 
 def normalize_spaces(value: str) -> str:
     return re.sub(r"\s+", " ", unicodedata.normalize("NFC", value).strip())
 
 
+def normalize_language_code(language: str) -> str:
+    """Return the canonical lowercase ISO 639-1 code used in persistence."""
+    normalized = normalize_spaces(language).casefold()
+    code = LANGUAGE_ALIASES.get(normalized, normalized)
+    if not re.fullmatch(r"[a-z]{2}", code):
+        raise ValueError("language must be a two-letter code (for example: de)")
+    return code
+
+
 def normalize_lemma(language: str, lemma: str) -> str:
+    language = normalize_language_code(language)
     normalized = normalize_spaces(lemma)
     if language == "de":
         return normalized.lower()
@@ -52,11 +71,12 @@ def normalize_deck_name(name: str) -> str:
 
 
 def language_spec(language: str) -> LanguageSpec:
-    return REGISTRY.get(language, FALLBACK)
+    return REGISTRY.get(normalize_language_code(language), FALLBACK)
 
 
 def validate_word(word: Word, language: str, *, strict_agent: bool = False) -> list[str]:
     """Validate a card, returning non-fatal warnings."""
+    language = normalize_language_code(language)
     if not normalize_spaces(word.lemma):
         raise CardValidationError("lemma is required")
     if not normalize_spaces(word.translation):

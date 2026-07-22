@@ -10,7 +10,7 @@ from psycopg import AsyncConnection
 
 from ..languages import ExerciseContext
 from ..models import Noun, Verb, Word
-from .base import CheckResult, check_text, fold_umlauts
+from .base import CheckResult, GeneratedExercise, check_text, fold_umlauts
 
 UMLAUT_MAP = [("au", "äu"), ("a", "ä"), ("o", "ö"), ("u", "ü")]
 SEPARABLE_PREFIXES = (
@@ -97,7 +97,9 @@ async def generate(
         "hint": f"{word.translation} ({word.lemma})",
     }
     expected = {"answer": target, "sentence": word.example}
-    return payload, expected
+    return GeneratedExercise(
+        payload, expected, "free_text", context.language, "tutor_on_mismatch"
+    )
 
 
 def check(expected: dict, answer: str) -> CheckResult:

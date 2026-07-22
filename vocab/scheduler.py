@@ -7,22 +7,21 @@ import random
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from psycopg import AsyncConnection
 from psycopg.types.json import Jsonb
 
-from . import db, srs, statistics
-from .exercises import GENERATORS
+from . import db, grading, reminders, srs, statistics
+from .exercises import GENERATORS, GeneratedExercise
 from .languages import ExerciseContext, language_spec, normalize_lemma
 
 STAGE_TYPES = {
     0: ["choice"],
-    1: ["flashcard_de_ru"],
+    1: ["flashcard_ru_de"],
     2: ["flashcard_ru_de", "cloze"],
     3: ["cloze", "grammar", "flashcard_ru_de"],
 }
-FALLBACK = ["flashcard_de_ru", "choice"]
+FALLBACK = ["flashcard_ru_de", "choice"]
 DEFAULT_NEW_SCAN = 5
 STARTED_SCAN_LIMIT = 100
 TASK_TTL = timedelta(hours=24)
@@ -209,7 +208,7 @@ async def create_task(
             else:
                 types = [name for name in STAGE_TYPES[stage] if name in allowed]
                 types.extend(name for name in FALLBACK if name in allowed and name not in types)
-            produced: tuple[dict[str, Any], dict[str, Any]] | None = None
+            produced: GeneratedExercise | None = None
             selected_type = ""
             for name in types:
                 generator = GENERATORS.get(name)
@@ -223,17 +222,26 @@ async def create_task(
                     return None
             if produced is None:
                 return None
-            payload, expected = produced
+            payload, expected = produced.payload, produced.expected
             await conn.execute(
                 """UPDATE tasks SET status = 'voided', voided_at = now()
                    WHERE user_id = %s AND status = 'open'""",
                 (user_id,),
             )
+            await conn.execute(
+                """UPDATE answer_evaluations e SET status = 'discarded',
+                          finished_at = now(), error = 'superseded by a new task'
+                   FROM tasks t
+                   WHERE e.task_id = t.id AND t.user_id = %s AND e.status = 'pending'
+                     AND t.status = 'voided'""",
+                (user_id,),
+            )
             task_id = uuid.uuid4().hex[:16]
             await conn.execute(
                 """INSERT INTO tasks(
-                       id, user_id, word_id, session_id, type, payload, expected, expires_at
-                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                       id, user_id, word_id, session_id, type, payload, expected, expires_at,
+                       response_mode, answer_language, grading_policy
+                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 (
                     task_id,
                     user_id,
@@ -243,6 +251,9 @@ async def create_task(
                     Jsonb(payload),
                     Jsonb(expected),
                     datetime.now(timezone.utc) + TASK_TTL,
+                    produced.response_mode,
+                    produced.answer_language,
+                    produced.grading_policy,
                 ),
             )
             if session_id:
@@ -258,6 +269,9 @@ async def create_task(
                 "word_id": row["id"],
                 "language": word.language,
                 "stage": stage,
+                "response_mode": produced.response_mode,
+                "answer_language": produced.answer_language,
+                "grading_policy": produced.grading_policy,
                 **payload,
             }
 
@@ -266,135 +280,377 @@ def _json_object(value: Any) -> dict[str, Any]:
     return json.loads(value) if isinstance(value, str) else dict(value or {})
 
 
-async def submit_answer(
+async def _locked_task(
+    conn: AsyncConnection[dict[str, Any]], user_id: int, task_id: str
+) -> dict[str, Any] | None:
+    result = await conn.execute(
+        """SELECT t.*, w.lemma, w.language, w.card, w.deck_id
+           FROM tasks t JOIN words w ON w.id = t.word_id
+           WHERE t.id = %s AND t.user_id = %s FOR UPDATE OF t""",
+        (task_id, user_id),
+    )
+    return await result.fetchone()
+
+
+def _expired(task: dict[str, Any]) -> bool:
+    return task["status"] != "open" or task["expires_at"] <= datetime.now(timezone.utc)
+
+
+async def _commit_review(
+    conn: AsyncConnection[dict[str, Any]],
+    task: dict[str, Any],
+    *,
+    answer: str,
+    correct: bool,
+    quality: int,
+    expected: str,
+    note: str = "",
+    grading_source: str,
+    evaluation_id: str | None = None,
+    grader_feedback: str | None = None,
+) -> dict[str, Any]:
+    progress_result = await conn.execute(
+        "SELECT * FROM progress WHERE word_id = %s FOR UPDATE", (task["word_id"],)
+    )
+    progress = await progress_result.fetchone()
+    schedule = srs.review(
+        reps=progress["reps"] if progress else 0,
+        lapses=progress["lapses"] if progress else 0,
+        ease=progress["ease"] if progress else 2.5,
+        interval_days=progress["interval_days"] if progress else 0.0,
+        quality=quality,
+    )
+    await conn.execute(
+        """INSERT INTO progress(word_id, reps, lapses, ease, interval_days, due_at)
+           VALUES (%s, %s, %s, %s, %s, %s)
+           ON CONFLICT(word_id) DO UPDATE SET
+               reps = EXCLUDED.reps,
+               lapses = EXCLUDED.lapses,
+               ease = EXCLUDED.ease,
+               interval_days = EXCLUDED.interval_days,
+               due_at = EXCLUDED.due_at,
+               updated_at = now()""",
+        (
+            task["word_id"], schedule.reps, schedule.lapses, schedule.ease,
+            schedule.interval_days, schedule.due_at,
+        ),
+    )
+    verdict = {
+        "correct": correct,
+        "expected": expected,
+        "note": note,
+        "grader_feedback": grader_feedback,
+        "grading_source": grading_source,
+        "answer_evaluation_id": evaluation_id,
+        "next_review_at": schedule.due_at,
+        "interval_days": schedule.interval_days,
+        "stage": srs.stage(schedule.reps, schedule.interval_days),
+    }
+    await conn.execute(
+        """UPDATE tasks SET status = 'answered', answered_at = now(), answer = %s,
+               correct = %s, verdict = %s WHERE id = %s""",
+        (answer, correct, Jsonb(verdict), task["id"]),
+    )
+    await conn.execute(
+        """INSERT INTO reviews(
+               user_id, word_id, deck_id, task_id, task_type, answer, correct, quality,
+               grading_source, answer_evaluation_id, grader_feedback
+           ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+        (
+            task["user_id"], task["word_id"], task["deck_id"], task["id"],
+            task["type"], answer, correct, quality, grading_source, evaluation_id,
+            grader_feedback,
+        ),
+    )
+    session_complete = False
+    session_answered_count: int | None = None
+    session_correct_count: int | None = None
+    if task["session_id"]:
+        updated = await conn.execute(
+            """UPDATE sessions SET
+                   answered_count = answered_count + 1,
+                   correct_count = correct_count + %s,
+                   last_activity_at = now()
+               WHERE id = %s AND user_id = %s AND status = 'open'
+               RETURNING *""",
+            (int(correct), task["session_id"], task["user_id"]),
+        )
+        session = await updated.fetchone()
+        if session:
+            session_answered_count = session["answered_count"]
+            session_correct_count = session["correct_count"]
+        if session and session["target_count"] is not None:
+            session_complete = session["answered_count"] >= session["target_count"]
+            if session_complete:
+                await conn.execute(
+                    "UPDATE sessions SET status = 'completed', ended_at = now() WHERE id = %s",
+                    (task["session_id"],),
+                )
+    card = _json_object(task["card"])
+    return {
+        "task_id": task["id"],
+        "correct": correct,
+        "expected": expected,
+        "note": note,
+        "grader_feedback": grader_feedback,
+        "grading_source": grading_source,
+        "answer_evaluation_id": evaluation_id,
+        "word": task["lemma"],
+        "translation": card.get("translation", ""),
+        "next_review_at": schedule.due_at,
+        "interval_days": schedule.interval_days,
+        "stage": verdict["stage"],
+        "session_complete": session_complete,
+        "session_answered_count": session_answered_count,
+        "session_correct_count": session_correct_count,
+    }
+
+
+def _evaluation_context(task: dict[str, Any]) -> dict[str, Any]:
+    payload = _json_object(task["payload"])
+    return {
+        "language": task["language"],
+        "answer_language": task["answer_language"],
+        "exercise_type": task["type"],
+        "prompt": payload.get("prompt", ""),
+        "hint": payload.get("hint"),
+        "requirements": {
+            "response_mode": task["response_mode"],
+            "grading_policy": task["grading_policy"],
+        },
+        "expected": _json_object(task["expected"]),
+        "word": task["lemma"],
+        "card": _json_object(task["card"]),
+    }
+
+
+async def begin_answer_submission(
     database: db.Database, user_id: int, task_id: str, answer: str
 ) -> dict[str, Any]:
     async with database.connection() as conn:
         async with conn.transaction():
-            result = await conn.execute(
-                """SELECT t.*, w.lemma, w.language, w.card, w.deck_id
-                   FROM tasks t JOIN words w ON w.id = t.word_id
-                   WHERE t.id = %s AND t.user_id = %s FOR UPDATE OF t""",
-                (task_id, user_id),
-            )
-            task = await result.fetchone()
+            task = await _locked_task(conn, user_id, task_id)
             if not task:
                 return {"error": "exercise expired", "task_id": task_id}
-            if task["status"] != "open" or task["expires_at"] <= datetime.now(timezone.utc):
+            if _expired(task):
                 if task["status"] == "open":
                     await conn.execute(
                         "UPDATE tasks SET status = 'voided', voided_at = now() WHERE id = %s",
                         (task_id,),
                     )
                 return {"error": "exercise expired", "task_id": task_id}
-
-            expected = _json_object(task["expected"])
-            checked = GENERATORS[task["type"]].check(expected, answer)
-            progress_result = await conn.execute(
-                "SELECT * FROM progress WHERE word_id = %s FOR UPDATE", (task["word_id"],)
+            pending = await db.fetch_one(
+                conn,
+                """SELECT * FROM answer_evaluations
+                   WHERE task_id = %s AND status = 'pending' FOR UPDATE""",
+                (task_id,),
             )
-            progress = await progress_result.fetchone()
-            schedule = srs.review(
-                reps=progress["reps"] if progress else 0,
-                lapses=progress["lapses"] if progress else 0,
-                ease=progress["ease"] if progress else 2.5,
-                interval_days=progress["interval_days"] if progress else 0.0,
-                quality=checked.quality,
-            )
-            await conn.execute(
-                """INSERT INTO progress(word_id, reps, lapses, ease, interval_days, due_at)
-                   VALUES (%s, %s, %s, %s, %s, %s)
-                   ON CONFLICT(word_id) DO UPDATE SET
-                       reps = EXCLUDED.reps,
-                       lapses = EXCLUDED.lapses,
-                       ease = EXCLUDED.ease,
-                       interval_days = EXCLUDED.interval_days,
-                       due_at = EXCLUDED.due_at,
-                       updated_at = now()""",
-                (
-                    task["word_id"],
-                    schedule.reps,
-                    schedule.lapses,
-                    schedule.ease,
-                    schedule.interval_days,
-                    schedule.due_at,
-                ),
-            )
-            verdict = {
-                "correct": checked.correct,
-                "expected": checked.expected,
-                "note": checked.note,
-                "next_review_at": schedule.due_at,
-                "interval_days": schedule.interval_days,
-                "stage": srs.stage(schedule.reps, schedule.interval_days),
-            }
-            await conn.execute(
-                """UPDATE tasks SET status = 'answered', answered_at = now(), answer = %s,
-                       correct = %s, verdict = %s WHERE id = %s""",
-                (answer, checked.correct, Jsonb(verdict), task_id),
-            )
-            await conn.execute(
-                """INSERT INTO reviews(
-                       user_id, word_id, deck_id, task_id, task_type, answer, correct, quality
-                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                (
-                    user_id,
-                    task["word_id"],
-                    task["deck_id"],
-                    task_id,
-                    task["type"],
-                    answer,
-                    checked.correct,
-                    checked.quality,
-                ),
-            )
-            session_complete = False
-            session_answered_count: int | None = None
-            session_correct_count: int | None = None
-            if task["session_id"]:
-                updated = await conn.execute(
-                    """UPDATE sessions SET
-                           answered_count = answered_count + 1,
-                           correct_count = correct_count + %s,
-                           last_activity_at = now()
-                       WHERE id = %s AND user_id = %s AND status = 'open'
-                       RETURNING *""",
-                    (int(checked.correct), task["session_id"], user_id),
+            if pending:
+                return {
+                    "task_id": task_id,
+                    "pending": True,
+                    "in_progress": True,
+                    "evaluation_id": pending["id"],
+                }
+            expected_data = _json_object(task["expected"])
+            checked = GENERATORS[task["type"]].check(expected_data, answer)
+            if (
+                task["response_mode"] == "free_text"
+                and task["grading_policy"] == "tutor_on_mismatch"
+                and not checked.correct
+            ):
+                evaluation_id = uuid.uuid4().hex
+                context = _evaluation_context(task)
+                await conn.execute(
+                    """INSERT INTO answer_evaluations(
+                           id, task_id, user_id, answer, answer_hash,
+                           deterministic_result, context
+                       ) VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (
+                        evaluation_id, task_id, user_id, answer,
+                        grading.answer_hash(answer),
+                        Jsonb(
+                            {
+                                "correct": checked.correct,
+                                "quality": checked.quality,
+                                "expected": checked.expected,
+                                "note": checked.note,
+                            }
+                        ),
+                        Jsonb(context),
+                    ),
                 )
-                session = await updated.fetchone()
-                if session:
-                    session_answered_count = session["answered_count"]
-                    session_correct_count = session["correct_count"]
-                if session and session["target_count"] is not None:
-                    session_complete = session["answered_count"] >= session["target_count"]
-                    if session_complete:
-                        await conn.execute(
-                            """UPDATE sessions SET status = 'completed', ended_at = now()
-                               WHERE id = %s""",
-                            (task["session_id"],),
-                        )
-            card = _json_object(task["card"])
-            return {
-                "task_id": task_id,
-                "correct": checked.correct,
-                "expected": checked.expected,
-                "note": checked.note,
-                "word": task["lemma"],
-                "translation": card.get("translation", ""),
-                "next_review_at": schedule.due_at,
-                "interval_days": schedule.interval_days,
-                "stage": verdict["stage"],
-                "session_complete": session_complete,
-                "session_answered_count": session_answered_count,
-                "session_correct_count": session_correct_count,
-            }
+                return {
+                    "task_id": task_id,
+                    "pending": True,
+                    "evaluation_id": evaluation_id,
+                    "answer": answer,
+                    "context": context,
+                }
+            return await _commit_review(
+                conn,
+                task,
+                answer=answer,
+                correct=checked.correct,
+                quality=checked.quality,
+                expected=checked.expected,
+                note=checked.note,
+                grading_source="deterministic",
+            )
+
+
+async def submit_answer(
+    database: db.Database, user_id: int, task_id: str, answer: str
+) -> dict[str, Any]:
+    """Compatibility entry point; free-text mismatches now return a pending evaluation."""
+    return await begin_answer_submission(database, user_id, task_id, answer)
+
+
+async def finalize_tutor_evaluation(
+    database: db.Database,
+    user_id: int,
+    evaluation_id: str,
+    *,
+    decision: str,
+    feedback: str,
+    model: str,
+) -> dict[str, Any]:
+    quality_by_decision = {"accepted": 4, "partial": 3, "rejected": 1}
+    if decision not in quality_by_decision:
+        raise ValueError("unsupported tutor decision")
+    async with database.connection() as conn:
+        async with conn.transaction():
+            evaluation = await db.fetch_one(
+                conn,
+                """SELECT id, task_id FROM answer_evaluations
+                   WHERE id = %s AND user_id = %s""",
+                (evaluation_id, user_id),
+            )
+            if not evaluation:
+                return {"stale": True, "evaluation_id": evaluation_id}
+            task = await _locked_task(conn, user_id, evaluation["task_id"])
+            result = await conn.execute(
+                """SELECT * FROM answer_evaluations
+                   WHERE id = %s AND user_id = %s FOR UPDATE""",
+                (evaluation_id, user_id),
+            )
+            evaluation = await result.fetchone()
+            if not evaluation or evaluation["status"] != "pending":
+                return {"stale": True, "evaluation_id": evaluation_id}
+            if not task or _expired(task):
+                await conn.execute(
+                    """UPDATE answer_evaluations SET status = 'discarded', finished_at = now()
+                       WHERE id = %s""",
+                    (evaluation_id,),
+                )
+                return {"stale": True, "evaluation_id": evaluation_id}
+            quality = quality_by_decision[decision]
+            expected_data = _json_object(task["expected"])
+            canonical = GENERATORS[task["type"]].check(expected_data, "").expected
+            await conn.execute(
+                """UPDATE answer_evaluations SET status = 'succeeded', decision = %s,
+                       quality = %s, feedback = %s, model = %s, finished_at = now()
+                   WHERE id = %s""",
+                (decision, quality, feedback[:500], model, evaluation_id),
+            )
+            return await _commit_review(
+                conn,
+                task,
+                answer=evaluation["answer"],
+                correct=decision != "rejected",
+                quality=quality,
+                expected=canonical,
+                note=feedback[:500],
+                grading_source="tutor",
+                evaluation_id=evaluation_id,
+                grader_feedback=feedback[:500],
+            )
+
+
+async def fail_tutor_evaluation(
+    database: db.Database,
+    user_id: int,
+    evaluation_id: str,
+    *,
+    error: str,
+    model: str,
+) -> dict[str, Any] | None:
+    async with database.connection() as conn:
+        result = await conn.execute(
+            """UPDATE answer_evaluations
+               SET status = 'failed', error = %s, model = %s, finished_at = now()
+               WHERE id = %s AND user_id = %s AND status = 'pending'
+               RETURNING *""",
+            (error[:1000], model, evaluation_id, user_id),
+        )
+        return await result.fetchone()
+
+
+async def evaluation_for_retry(
+    database: db.Database, user_id: int, evaluation_id: str
+) -> dict[str, Any] | None:
+    async with database.connection() as conn:
+        return await db.fetch_one(
+            conn,
+            """SELECT * FROM answer_evaluations
+               WHERE id = %s AND user_id = %s AND status = 'failed'""",
+            (evaluation_id, user_id),
+        )
+
+
+async def retry_tutor_evaluation(
+    database: db.Database, user_id: int, evaluation_id: str
+) -> dict[str, Any]:
+    evaluation = await evaluation_for_retry(database, user_id, evaluation_id)
+    if not evaluation:
+        return {"error": "evaluation unavailable", "evaluation_id": evaluation_id}
+    return await begin_answer_submission(
+        database, user_id, evaluation["task_id"], evaluation["answer"]
+    )
+
+
+async def override_answer_incorrect(
+    database: db.Database, user_id: int, task_id: str
+) -> dict[str, Any]:
+    async with database.connection() as conn:
+        async with conn.transaction():
+            task = await _locked_task(conn, user_id, task_id)
+            if not task or _expired(task):
+                return {"error": "exercise expired", "task_id": task_id}
+            evaluation = await db.fetch_one(
+                conn,
+                """SELECT * FROM answer_evaluations WHERE task_id = %s
+                   ORDER BY created_at DESC LIMIT 1 FOR UPDATE""",
+                (task_id,),
+            )
+            answer = evaluation["answer"] if evaluation else ""
+            if evaluation and evaluation["status"] == "pending":
+                await conn.execute(
+                    """UPDATE answer_evaluations SET status = 'discarded', finished_at = now()
+                       WHERE id = %s""",
+                    (evaluation["id"],),
+                )
+            expected_data = _json_object(task["expected"])
+            canonical = GENERATORS[task["type"]].check(expected_data, "").expected
+            return await _commit_review(
+                conn,
+                task,
+                answer=answer,
+                correct=False,
+                quality=1,
+                expected=canonical,
+                note="Ответ засчитан неверным по выбору ученика.",
+                grading_source="learner_override",
+                evaluation_id=evaluation["id"] if evaluation else None,
+            )
 
 
 async def get_open_task(database: db.Database, user_id: int) -> dict[str, Any] | None:
     async with database.connection() as conn:
         return await db.fetch_one(
             conn,
-            """SELECT id AS task_id, type, payload, word_id, session_id, created_at, expires_at
+            """SELECT id AS task_id, type, payload, word_id, session_id, response_mode,
+                      answer_language, grading_policy, created_at, expires_at
                FROM tasks WHERE user_id = %s AND status = 'open' AND expires_at > now()""",
             (user_id,),
         )
@@ -416,6 +672,9 @@ async def task_context(
         "task_id": row["id"],
         "status": row["status"],
         "type": row["type"],
+        "response_mode": row["response_mode"],
+        "answer_language": row["answer_language"],
+        "grading_policy": row["grading_policy"],
         "payload": _json_object(row["payload"]),
         "word": row["lemma"],
         "card": _json_object(row["card"]),
@@ -429,11 +688,17 @@ async def task_context(
 
 async def sweep_expired(database: db.Database) -> int:
     async with database.connection() as conn:
-        result = await conn.execute(
-            """UPDATE tasks SET status = 'voided', voided_at = now()
-               WHERE status = 'open' AND expires_at <= now()"""
-        )
-        return result.rowcount
+        async with conn.transaction():
+            failed = await conn.execute(
+                """UPDATE answer_evaluations SET status = 'failed',
+                          error = 'grading attempt timed out', finished_at = now()
+                   WHERE status = 'pending' AND created_at < now() - interval '10 minutes'"""
+            )
+            expired = await conn.execute(
+                """UPDATE tasks SET status = 'voided', voided_at = now()
+                   WHERE status = 'open' AND expires_at <= now()"""
+            )
+            return failed.rowcount + expired.rowcount
 
 
 async def start_session(
@@ -521,145 +786,10 @@ async def close_idle_sessions(database: db.Database) -> int:
             return len(rows)
 
 
-def _in_quiet_hours(user: dict[str, Any], now: datetime) -> bool:
-    local = now.astimezone(ZoneInfo(user["timezone"])).time().replace(tzinfo=None)
-    start = user["quiet_start"]
-    end = user["quiet_end"]
-    if start < end:
-        return start <= local < end
-    return local >= start or local < end
-
-
-async def _due_rows_for_push(
-    conn: AsyncConnection[dict[str, Any]], user_id: int, limit: int = 5
-) -> tuple[list[dict[str, Any]], bool]:
-    rows = await db.fetch_all(
-        conn,
-        """SELECT w.*, p.reps, p.lapses, p.ease, p.interval_days, p.due_at,
-                  lr.correct AS last_review_correct
-           FROM progress p JOIN words w ON w.id = p.word_id
-           JOIN decks d ON d.id = w.deck_id
-           LEFT JOIN LATERAL (
-               SELECT correct FROM reviews r WHERE r.word_id = w.id
-               ORDER BY r.created_at DESC LIMIT 1
-           ) lr ON true
-           WHERE w.user_id = %s AND p.due_at <= now()
-             AND w.card_status = 'active' AND NOT d.is_archive
-           ORDER BY p.due_at, w.id LIMIT %s""",
-        (user_id, limit),
-    )
-    has_non_lapse_trigger = any(
-        not (
-            row["reps"] == 0
-            and float(row["interval_days"]) == 0
-            and row["last_review_correct"] is False
-        )
-        for row in rows
-    )
-    return rows, has_non_lapse_trigger
-
-
-def _has_push_trigger(rows: list[dict[str, Any]]) -> bool:
-    return any(
-        not (
-            row["reps"] == 0
-            and float(row["interval_days"]) == 0
-            and row["last_review_correct"] is False
-        )
-        for row in rows
-    )
-
-
-async def _push_rows(
-    conn: AsyncConnection[dict[str, Any]], user_id: int, limit: int
-) -> tuple[list[dict[str, Any]], bool, str]:
-    plan = await db.fetch_one(
-        conn,
-        """SELECT p.plan FROM curator_plans p
-           WHERE p.user_id = %s AND p.kind = 'plan'
-             AND p.created_at >= now() - interval '24 hours'
-             AND NOT EXISTS (
-                 SELECT 1 FROM curator_runs r
-                 WHERE r.user_id = p.user_id AND r.kind = p.kind
-                   AND r.status = 'failed' AND r.started_at > p.created_at
-             )
-           ORDER BY p.created_at DESC LIMIT 1""",
-        (user_id,),
-    )
-    if plan:
-        value = _json_object(plan["plan"])
-        word_ids = [int(item["word_id"]) for item in value.get("focus", []) if item.get("word_id")]
-        if word_ids:
-            rows = await db.fetch_all(
-                conn,
-                """SELECT w.*, p.reps, p.lapses, p.ease, p.interval_days, p.due_at,
-                          lr.correct AS last_review_correct
-                   FROM progress p JOIN words w ON w.id = p.word_id
-                   JOIN decks d ON d.id = w.deck_id
-                   LEFT JOIN LATERAL (
-                       SELECT correct FROM reviews r WHERE r.word_id = w.id
-                       ORDER BY r.created_at DESC LIMIT 1
-                   ) lr ON true
-                   WHERE w.user_id = %s AND p.due_at <= now() AND w.id = ANY(%s)
-                     AND w.card_status = 'active' AND NOT d.is_archive
-                   ORDER BY array_position(%s::bigint[], w.id) LIMIT %s""",
-                (user_id, word_ids, word_ids, limit),
-            )
-            if rows:
-                return rows, _has_push_trigger(rows), "curator"
-    rows, trigger = await _due_rows_for_push(conn, user_id, limit)
-    return rows, trigger, "deterministic"
-
-
-async def compose_push(database: db.Database, user_id: int, limit: int = 5) -> dict[str, Any]:
-    async with database.connection() as conn:
-        rows, _, source = await _push_rows(conn, user_id, limit)
-    return {"user_id": user_id, "word_ids": [row["id"] for row in rows], "source": source}
-
-
 async def claim_push(
     database: db.Database, user_id: int, *, now: datetime | None = None, limit: int = 5
 ) -> dict[str, Any] | None:
-    now = now or datetime.now(timezone.utc)
-    async with database.connection() as conn:
-        async with conn.transaction():
-            result = await conn.execute("SELECT * FROM users WHERE id = %s FOR UPDATE", (user_id,))
-            user = await result.fetchone()
-            if not user or _in_quiet_hours(user, now):
-                return None
-            long_session = await db.fetch_one(
-                conn,
-                """SELECT id FROM sessions
-                   WHERE user_id = %s AND kind = 'long' AND status = 'open'""",
-                (user_id,),
-            )
-            if long_session:
-                return None
-            last = await db.fetch_one(
-                conn,
-                """SELECT claimed_at FROM deliveries
-                   WHERE user_id = %s AND kind = 'push' AND status IN ('claimed', 'sent')
-                   ORDER BY claimed_at DESC LIMIT 1""",
-                (user_id,),
-            )
-            if last and now - last["claimed_at"] < timedelta(
-                minutes=user["min_push_interval_minutes"]
-            ):
-                return None
-            rows, has_trigger, source = await _push_rows(conn, user_id, limit)
-            if not rows or not has_trigger:
-                return None
-            interval_seconds = user["min_push_interval_minutes"] * 60
-            bucket = int(now.timestamp()) // interval_seconds
-            key = f"push:{user_id}:{bucket}"
-            payload = {"word_ids": [row["id"] for row in rows], "source": source}
-            inserted = await conn.execute(
-                """INSERT INTO deliveries(user_id, kind, idempotency_key, payload, claimed_at)
-                   VALUES (%s, 'push', %s, %s, %s)
-                   ON CONFLICT(idempotency_key) DO NOTHING RETURNING *""",
-                (user_id, key, Jsonb(payload), now),
-            )
-            return await inserted.fetchone()
+    return await reminders.claim_due_delivery(database, user_id, now=now)
 
 
 async def mark_delivery_sent(
@@ -691,8 +821,8 @@ async def claim_digest(
     key = f"digest:{user_id}:{run_date}"
     async with database.connection() as conn:
         result = await conn.execute(
-            """INSERT INTO deliveries(user_id, kind, idempotency_key, payload)
-               VALUES (%s, 'digest', %s, %s)
+            """INSERT INTO deliveries(user_id, kind, idempotency_key, payload, claimed_at)
+               VALUES (%s, 'digest', %s, %s, now())
                ON CONFLICT(idempotency_key) DO NOTHING RETURNING *""",
             (user_id, key, Jsonb(payload)),
         )

@@ -222,11 +222,10 @@ class TutorService:
                 run_config=RunConfig(tracing_disabled=True, trace_include_sensitive_data=False),
             )
             usage = result.context_wrapper.usage
+            input_price, output_price = self.settings.prices_for("tutor")
             actual = (
-                Decimal(usage.input_tokens)
-                * Decimal(str(self.settings.llm_input_usd_per_million))
-                + Decimal(usage.output_tokens)
-                * Decimal(str(self.settings.llm_output_usd_per_million))
+                Decimal(usage.input_tokens) * Decimal(str(input_price))
+                + Decimal(usage.output_tokens) * Decimal(str(output_price))
             ) / Decimal(1_000_000)
             await llm.reconcile(
                 database,

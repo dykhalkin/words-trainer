@@ -4,9 +4,10 @@ import asyncio
 import random
 import unittest
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from tests.support import temporary_database
-from vocab import db, scheduler, words
+from vocab import db, reminders, scheduler, words
 from vocab.models import Word
 
 
@@ -169,7 +170,7 @@ class SessionIntegrityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(first["word"], "alt")
         await scheduler.submit_answer(
-            self.database, self.owner["id"], first["task_id"], "старый"
+            self.database, self.owner["id"], first["task_id"], "alt"
         )
         second = await scheduler.create_task(
             self.database,
@@ -190,25 +191,45 @@ class SessionIntegrityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(empty)
 
     async def test_push_claim_rules_and_restart_idempotency(self) -> None:
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
         async with self.database.connection() as conn:
             await conn.execute(
-                """UPDATE users SET quiet_start = '22:00', quiet_end = '09:00',
-                       min_push_interval_minutes = 180 WHERE id = %s""",
-                (self.owner["id"],),
-            )
-            await conn.execute(
                 """INSERT INTO progress(word_id, reps, interval_days, due_at)
-                   VALUES (%s, 3, 7, now() - interval '1 minute')""",
-                (self.word_rows[0]["id"],),
+                   VALUES (%s, 3, 7, %s)""",
+                (self.word_rows[0]["id"], now - timedelta(minutes=1)),
             )
-        now = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+        policy = await reminders.get_policy(self.database, self.owner["id"])
+        await reminders.update_policy(
+            self.database,
+            self.owner["id"],
+            expected_revision=policy["revision"],
+            mode="smart",
+            window_start="00:00",
+            window_end="23:59",
+            target_interval_minutes=180,
+        )
+        scheduled = now + timedelta(minutes=20)
+        scheduled += timedelta(minutes=(-scheduled.minute) % 5)
+        local = scheduled.astimezone(ZoneInfo("Europe/Berlin"))
+        await reminders.materialize_plan(
+            self.database,
+            self.owner["id"],
+            [{
+                "local_date": local.date().isoformat(),
+                "local_time": local.strftime("%H:%M"),
+                "word_ids": [self.word_rows[0]["id"]],
+                "text": "test",
+            }],
+            source="deterministic",
+            now=now,
+        )
         first, second = await asyncio.gather(
-            scheduler.claim_push(self.database, self.owner["id"], now=now),
-            scheduler.claim_push(self.database, self.owner["id"], now=now),
+            scheduler.claim_push(self.database, self.owner["id"], now=scheduled),
+            scheduler.claim_push(self.database, self.owner["id"], now=scheduled),
         )
         self.assertEqual(sum(item is not None for item in (first, second)), 1)
         restarted_attempt = await scheduler.claim_push(
-            self.database, self.owner["id"], now=now + timedelta(minutes=1)
+            self.database, self.owner["id"], now=scheduled + timedelta(minutes=1)
         )
         self.assertIsNone(restarted_attempt)
 

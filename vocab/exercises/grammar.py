@@ -10,7 +10,7 @@ from psycopg import AsyncConnection
 from .. import db
 from ..languages import ExerciseContext
 from ..models import PERSONS, Noun, Verb, VerbPrep, Word
-from .base import CheckResult, check_text
+from .base import CheckResult, GeneratedExercise, check_text
 
 TENSE_NAMES = {"praesens": "Präsens", "perfekt": "Perfekt", "praeteritum": "Präteritum"}
 
@@ -21,13 +21,21 @@ async def generate(
     rng: random.Random,
     context: ExerciseContext,
 ):
+    produced = None
     if isinstance(word, Noun):
-        return _noun_task(word, rng)
-    if isinstance(word, Verb):
-        return _verb_task(word, rng)
-    if isinstance(word, VerbPrep):
-        return await _prep_task(word, conn, rng, context)
-    return None
+        produced = _noun_task(word, rng)
+    elif isinstance(word, Verb):
+        produced = _verb_task(word, rng)
+    elif isinstance(word, VerbPrep):
+        produced = await _prep_task(word, conn, rng, context)
+    if produced is None:
+        return None
+    payload, expected = produced
+    if payload.get("options"):
+        return GeneratedExercise(payload, expected, "choice", None, "deterministic")
+    return GeneratedExercise(
+        payload, expected, "free_text", context.language, "tutor_on_mismatch"
+    )
 
 
 def _noun_task(word: Noun, rng: random.Random):

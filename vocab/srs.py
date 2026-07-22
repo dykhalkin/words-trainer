@@ -8,9 +8,9 @@ Quality scale (subset of classic 0-5):
 
 Stage drives exercise difficulty (see scheduler):
     0 — new or lapsed       -> recognition (multiple choice)
-    1 — learning            -> flashcard DE->RU
-    2 — consolidating       -> flashcard RU->DE, cloze
-    3 — mature              -> cloze, grammar
+    1 — learning            -> target-language recall
+    2 — consolidating       -> target-language recall, cloze
+    3 — mature              -> cloze, grammar, target-language recall
 """
 
 from __future__ import annotations

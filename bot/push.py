@@ -7,7 +7,7 @@ from typing import Any
 
 from aiogram import Bot
 
-from vocab import db, scheduler, words
+from vocab import db, reminders, scheduler, words
 
 from .keyboards import start_keyboard
 
@@ -20,12 +20,15 @@ async def run_push_cycle(bot: Bot, database: db.Database) -> int:
         delivery = await scheduler.claim_push(database, learner["id"])
         if not delivery:
             continue
+        if not await reminders.authorize_claimed_delivery(database, delivery["id"]):
+            continue
         payload: dict[str, Any] = delivery["payload"]
         count = len(payload.get("word_ids") or [])
+        text = str(payload.get("text") or "").strip()
         try:
             message = await bot.send_message(
                 learner["chat_id"],
-                f"Пора повторить {count} слов. Это займёт пару минут.",
+                text or f"Пора повторить {count} слов. Это займёт пару минут.",
                 reply_markup=start_keyboard(delivery["id"]),
             )
         except Exception as exc:

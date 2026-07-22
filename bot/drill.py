@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from aiogram import Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, Message
 
-from vocab import db, scheduler, statistics, words
+from vocab import db, llm, reminders, scheduler, statistics, words
+
+from .grader import TutorGraderService
 
 from .keyboards import (
     AnswerCallback,
@@ -18,15 +21,18 @@ from .keyboards import (
     StartSessionCallback,
     StatsDeckCallback,
     WordActionCallback,
+    GradeCallback,
     answer_keyboard,
     confirm_word_action_keyboard,
     deck_picker_keyboard,
     explain_keyboard,
+    grading_failure_keyboard,
     issues_keyboard,
 )
 from .presentation import session_summary, stats_text, task_text, verdict_text
 
 router = Router(name="drill")
+logger = logging.getLogger(__name__)
 
 
 def _payload(value: Any) -> dict[str, Any]:
@@ -56,20 +62,87 @@ async def finish_answer(
     answer: str,
     *,
     edit: bool,
+    grader: TutorGraderService | None = None,
 ) -> None:
-    verdict = await scheduler.submit_answer(database, learner["id"], task_id, answer)
+    verdict = await scheduler.begin_answer_submission(
+        database, learner["id"], task_id, answer
+    )
     if verdict.get("error"):
         if not edit:
             await message.answer("Это упражнение уже неактивно.")
         return
-    rendered = verdict_text(verdict)
-    if edit:
-        original = message.text or "Упражнение"
-        await message.edit_text(
-            f"{original}\n\n{rendered}", reply_markup=explain_keyboard(task_id)
+    if verdict.get("pending"):
+        if verdict.get("in_progress"):
+            await message.answer("Ответ уже проверяется.")
+            return
+        status = await message.answer("Проверяю ответ…")
+        if grader is None or not grader.available:
+            await scheduler.fail_tutor_evaluation(
+                database,
+                learner["id"],
+                verdict["evaluation_id"],
+                error="OpenAI is not configured",
+                model=grader.model if grader else "unconfigured",
+            )
+            await status.edit_text(
+                "Не удалось проверить ответ. Можно повторить проверку, изменить ответ "
+                "или засчитать его неверным.",
+                reply_markup=grading_failure_keyboard(task_id, verdict["evaluation_id"]),
+            )
+            return
+        try:
+            grade = await grader.grade(
+                database,
+                learner,
+                context=verdict["context"],
+                answer=verdict["answer"],
+            )
+            verdict = await scheduler.finalize_tutor_evaluation(
+                database,
+                learner["id"],
+                verdict["evaluation_id"],
+                decision=grade.decision,
+                feedback=grade.feedback_ru,
+                model=grader.model,
+            )
+        except llm.BudgetExceeded as exc:
+            await scheduler.fail_tutor_evaluation(
+                database, learner["id"], verdict["evaluation_id"],
+                error=str(exc), model=grader.model,
+            )
+            await status.edit_text(
+                "Лимит проверки ответов исчерпан. Можно изменить ответ или засчитать его неверным.",
+                reply_markup=grading_failure_keyboard(task_id, verdict["evaluation_id"]),
+            )
+            return
+        except Exception as exc:
+            logger.exception("answer grader call failed")
+            await scheduler.fail_tutor_evaluation(
+                database, learner["id"], verdict["evaluation_id"],
+                error=str(exc), model=grader.model,
+            )
+            await status.edit_text(
+                "Не удалось проверить ответ. Можно повторить проверку, изменить ответ "
+                "или засчитать его неверным.",
+                reply_markup=grading_failure_keyboard(task_id, verdict["evaluation_id"]),
+            )
+            return
+        if verdict.get("stale"):
+            await status.edit_text("Упражнение уже изменилось; результат проверки отброшен.")
+            return
+        await status.edit_text(
+            verdict_text(verdict), reply_markup=explain_keyboard(task_id)
         )
+        edit = False
     else:
-        await message.answer(rendered, reply_markup=explain_keyboard(task_id))
+        rendered = verdict_text(verdict)
+        if edit:
+            original = message.text or "Упражнение"
+            await message.edit_text(
+                f"{original}\n\n{rendered}", reply_markup=explain_keyboard(task_id)
+            )
+        else:
+            await message.answer(rendered, reply_markup=explain_keyboard(task_id))
     if verdict.get("session_complete"):
         await message.answer(
             session_summary(
@@ -83,6 +156,52 @@ async def finish_answer(
     await send_task(message, database, learner)
 
 
+@router.callback_query(GradeCallback.filter())
+async def resolve_grade_failure(
+    callback: CallbackQuery,
+    callback_data: GradeCallback,
+    database: db.Database,
+    learner: dict[str, Any],
+    grader: TutorGraderService,
+) -> None:
+    if not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+    if callback_data.action == "wrong":
+        verdict = await scheduler.override_answer_incorrect(
+            database, learner["id"], callback_data.task_id
+        )
+        if verdict.get("error"):
+            await callback.answer("Упражнение уже неактивно")
+            return
+        await callback.answer()
+        await callback.message.edit_text(
+            verdict_text(verdict), reply_markup=explain_keyboard(callback_data.task_id)
+        )
+        await send_task(callback.message, database, learner)
+        return
+    if callback_data.action != "retry":
+        await callback.answer("Неизвестное действие")
+        return
+    evaluation = await scheduler.evaluation_for_retry(
+        database, learner["id"], callback_data.evaluation_id
+    )
+    if not evaluation or evaluation["task_id"] != callback_data.task_id:
+        await callback.answer("Проверка уже недоступна")
+        return
+    await callback.answer()
+    await callback.message.edit_text("Повторяю проверку…", reply_markup=None)
+    await finish_answer(
+        callback.message,
+        database,
+        learner,
+        callback_data.task_id,
+        evaluation["answer"],
+        edit=False,
+        grader=grader,
+    )
+
+
 @router.message(CommandStart())
 async def start(message: Message) -> None:
     await message.answer(
@@ -90,6 +209,7 @@ async def start(message: Message) -> None:
         "/practice — длинная тренировка\n"
         "/decks — колоды\n"
         "/stats — статистика\n"
+        "/reminders — умные напоминания\n"
         "/issues — карточки, требующие исправления\n"
         "/stop — остановить тренировку"
     )
@@ -97,6 +217,7 @@ async def start(message: Message) -> None:
 
 @router.message(Command("practice"))
 async def practice(message: Message, database: db.Database, learner: dict[str, Any]) -> None:
+    await reminders.clear_pending_action(database, learner["id"])
     decks = [row for row in await words.list_decks(database, learner["id"]) if not row["is_archive"]]
     await message.answer(
         "Выберите колоду для тренировки:", reply_markup=deck_picker_keyboard(decks)

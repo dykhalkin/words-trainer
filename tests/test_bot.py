@@ -8,10 +8,12 @@ from unittest.mock import AsyncMock
 
 from aiogram.types import Chat, Message, Update, User
 
-from bot.config import load_settings
+from bot.config import Settings, load_settings
 from bot.keyboards import (
     AnswerCallback,
+    GradeCallback,
     PracticeDeckCallback,
+    ReminderCallback,
     StatsDeckCallback,
     WordActionCallback,
     answer_keyboard,
@@ -36,6 +38,12 @@ class BotPresentationTests(unittest.TestCase):
             WordActionCallback(
                 task_id="1234567890abcdef", action="archive", confirm=1
             ).pack(),
+            GradeCallback(
+                task_id="1234567890abcdef",
+                evaluation_id="f" * 32,
+                action="retry",
+            ).pack(),
+            ReminderCallback(action="cadence", value="1440", revision=999999).pack(),
         ]
         self.assertTrue(all(len(value.encode()) <= 64 for value in payloads))
 
@@ -98,6 +106,26 @@ class ConfigTests(unittest.TestCase):
                     os.environ.pop(name, None)
                     if previous[name] is not None:
                         os.environ[name] = previous[name]  # type: ignore[assignment]
+
+    def test_model_specific_prices_and_explicit_override(self) -> None:
+        settings = Settings(
+            TELEGRAM_BOT_TOKEN="token",
+            DATABASE_URL="postgresql://unused",
+            OWNER_CHAT_ID=101,
+            TUTOR_MODEL="gpt-5.6-luna",
+            CURATOR_MODEL="gpt-5.6-terra",
+        )
+        self.assertEqual(settings.prices_for("tutor"), (1.0, 6.0))
+        self.assertEqual(settings.prices_for("grader"), (1.0, 6.0))
+        self.assertEqual(settings.prices_for("curator"), (2.5, 15.0))
+        overridden = Settings(
+            TELEGRAM_BOT_TOKEN="token",
+            DATABASE_URL="postgresql://unused",
+            OWNER_CHAT_ID=101,
+            TUTOR_MODEL="gpt-5.6-luna",
+            TUTOR_INPUT_USD_PER_MILLION=9.0,
+        )
+        self.assertEqual(overridden.prices_for("tutor"), (9.0, 6.0))
 
 
 class AllowlistTests(unittest.IsolatedAsyncioTestCase):

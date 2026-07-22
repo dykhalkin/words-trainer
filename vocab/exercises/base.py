@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
-import difflib
 import re
 from dataclasses import dataclass
+from typing import Any, Literal
 
-TYPO_RATIO = 0.85
+
+@dataclass(frozen=True)
+class GeneratedExercise:
+    payload: dict[str, Any]
+    expected: dict[str, Any]
+    response_mode: Literal["choice", "free_text"]
+    answer_language: str | None
+    grading_policy: Literal["deterministic", "tutor_on_mismatch"]
+
+    def __iter__(self):
+        """Keep tuple unpacking compatible for low-level generator callers."""
+        yield self.payload
+        yield self.expected
 
 
 @dataclass
@@ -35,24 +47,12 @@ def same(a: str, b: str) -> bool:
     return a == b or fold_umlauts(a) == fold_umlauts(b)
 
 
-def is_typo(answer: str, expected: str) -> bool:
-    a, e = fold_umlauts(normalize(answer)), fold_umlauts(normalize(expected))
-    return difflib.SequenceMatcher(None, a, e).ratio() >= TYPO_RATIO
-
-
 def check_text(
     answer: str, accepted: list[str], canonical: str,
-    *, exact_quality: int = 4, allow_typo: bool = True,
+    *, exact_quality: int = 4, allow_typo: bool = False,
 ) -> CheckResult:
-    """Grade a free-text answer against accepted variants.
-
-    allow_typo=False for grammar drills, where endings are the whole point.
-    """
+    """Accept only normalized variants; semantic mismatches are graded by the tutor."""
     for variant in accepted:
         if same(answer, variant):
             return CheckResult(True, exact_quality, canonical)
-    if allow_typo:
-        for variant in accepted:
-            if is_typo(answer, variant):
-                return CheckResult(True, 3, canonical, note="почти верно (опечатка)")
     return CheckResult(False, 1, canonical)

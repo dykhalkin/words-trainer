@@ -16,8 +16,10 @@ from .agent import TutorService
 from .chat import router as chat_router
 from .curator import CuratorService
 from .drill import router
+from .grader import TutorGraderService
 from .logging import configure_logging
 from .middleware import LearnerMiddleware
+from .reminders import router as reminders_router
 from .jobs import BotJobRunner
 
 logger = logging.getLogger(__name__)
@@ -31,8 +33,10 @@ async def run(settings: Settings) -> None:
         LearnerMiddleware(database, settings.allowed_chat_ids)
     )
     dispatcher.include_router(router)
+    dispatcher.include_router(reminders_router)
     dispatcher.include_router(chat_router)
     tutor = TutorService(settings)
+    grader = TutorGraderService(settings)
     curator = CuratorService(settings)
     job_runner = BotJobRunner(database, bot, curator)
     scheduler = AsyncIOScheduler(job_defaults={"coalesce": True, "misfire_grace_time": 900})
@@ -56,8 +60,15 @@ async def run(settings: Settings) -> None:
     scheduler.add_job(
         job_runner.scheduled,
         "interval",
-        hours=1,
-        args=("curator_plan", 3600),
+        minutes=5,
+        args=("curator_plan", 300),
+        max_instances=1,
+    )
+    scheduler.add_job(
+        job_runner.scheduled,
+        "interval",
+        seconds=30,
+        args=("reminder_refresh", 30),
         max_instances=1,
     )
     scheduler.add_job(
@@ -78,11 +89,14 @@ async def run(settings: Settings) -> None:
                 BotCommand(command="decks", description="мои колоды"),
                 BotCommand(command="stats", description="статистика"),
                 BotCommand(command="issues", description="карточки с ошибками"),
+                BotCommand(command="reminders", description="умные напоминания"),
                 BotCommand(command="stop", description="остановить тренировку"),
             ]
         )
         scheduler.start()
-        await dispatcher.start_polling(bot, close_bot_session=False, tutor=tutor)
+        await dispatcher.start_polling(
+            bot, close_bot_session=False, tutor=tutor, grader=grader
+        )
     finally:
         if scheduler.running:
             scheduler.shutdown(wait=False)

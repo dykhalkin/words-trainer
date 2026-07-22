@@ -56,14 +56,13 @@ class SrsTests(unittest.TestCase):
 
 
 class ExerciseTests(unittest.TestCase):
-    def test_rude_accepts_noun_without_article_as_low_quality(self) -> None:
+    def test_rude_mismatch_requires_semantic_grading(self) -> None:
         result = flashcard.RuDe.check(
             {"lemma": "die Salbe", "kind": "noun", "headword": "Salbe"},
             "Salbe",
         )
-        self.assertTrue(result.correct)
-        self.assertEqual(result.quality, 3)
-        self.assertIn("артикль", result.note)
+        self.assertFalse(result.correct)
+        self.assertEqual(result.quality, 1)
 
 
 if __name__ == "__main__":

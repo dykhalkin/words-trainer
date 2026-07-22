@@ -1,7 +1,8 @@
-"""Translation flashcards.
+"""Target-language recall flashcards plus the legacy native-answer checker.
 
-DeRu (stage 1): show German word, expect Russian translation (recognition).
-RuDe (stage 2): show Russian, expect German word with article / preposition (recall).
+Only ``RuDe`` is registered for new tasks: the prompt may contain a native-language
+translation, but the learner always types the target-language lemma. ``DeRu`` remains
+solely so historical task data can still be interpreted during the migration window.
 """
 
 from __future__ import annotations
@@ -12,9 +13,9 @@ from typing import Any
 
 from psycopg import AsyncConnection
 
-from ..languages import ExerciseContext
+from ..languages import ExerciseContext, language_spec
 from ..models import Noun, VerbPrep, Word
-from .base import CheckResult, check_text, normalize, same
+from .base import CheckResult, GeneratedExercise, check_text
 
 
 def translation_variants(translation: str) -> list[str]:
@@ -25,6 +26,8 @@ def translation_variants(translation: str) -> list[str]:
 
 
 class DeRu:
+    """Legacy, unregistered checker for historical ``flashcard_de_ru`` rows."""
+
     @staticmethod
     async def generate(
         word: Word,
@@ -55,34 +58,21 @@ class RuDe:
             "verb_prep": " (с предлогом и падежом)",
         }
         payload = {
-            "prompt": f"Скажи по-немецки: «{word.translation}»{hints.get(word.kind, '')}"
+            "prompt": (
+                f"Скажи {language_spec(context.language).prompt_name_ru}: "
+                f"«{word.translation}»{hints.get(word.kind, '')}"
+            )
         }
         expected = {
             "lemma": word.lemma,
             "kind": word.kind,
             "headword": word.headword,
         }
-        return payload, expected
+        return GeneratedExercise(
+            payload, expected, "free_text", context.language, "tutor_on_mismatch"
+        )
 
     @staticmethod
     def check(expected: dict, answer: str) -> CheckResult:
-        lemma, kind, headword = expected["lemma"], expected["kind"], expected["headword"]
-        if kind == "noun":
-            if same(answer, lemma):
-                return CheckResult(True, 5, lemma)
-            if same(answer, headword):
-                return CheckResult(True, 3, lemma, note="слово верное, но нужен артикль")
-            # wrong article, right noun
-            m = re.match(r"^(der|die|das)\s+(.+)$", normalize(answer))
-            if m and same(m.group(2), headword):
-                return CheckResult(False, 2, lemma, note="неверный артикль")
-            return check_text(answer, [lemma], lemma, exact_quality=5)
-        if kind == "verb_prep":
-            ans = normalize(answer).replace("+", " ").replace(".", " ")
-            full = normalize(lemma).replace("+", " ")
-            if " ".join(ans.split()) == " ".join(full.split()):
-                return CheckResult(True, 5, lemma)
-            if same(answer, headword):
-                return CheckResult(True, 3, lemma, note="укажи также предлог и падеж")
-            return check_text(answer, [lemma], lemma, exact_quality=5)
+        lemma = expected["lemma"]
         return check_text(answer, [lemma], lemma, exact_quality=5)

@@ -102,6 +102,16 @@ class WordLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(collision3)
         self.assertNotEqual(first["id"], distinct["id"])
 
+    async def test_language_names_are_stored_as_two_letter_codes(self) -> None:
+        deck = await words.create_deck(
+            self.database, self.owner["id"], "German", "Canonical German"
+        )
+        self.assertEqual(deck["language"], "de")
+        with self.assertRaisesRegex(ValueError, "two-letter code"):
+            await words.create_deck(
+                self.database, self.owner["id"], "not-a-language", "Invalid"
+            )
+
     async def test_delete_deck_moves_words_and_protects_general(self) -> None:
         inserted, _ = await words.add_word(
             self.database,

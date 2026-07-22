@@ -45,6 +45,18 @@ class IssuesCallback(CallbackData, prefix="i"):
     page: int
 
 
+class GradeCallback(CallbackData, prefix="g"):
+    task_id: str
+    evaluation_id: str
+    action: str
+
+
+class ReminderCallback(CallbackData, prefix="r"):
+    action: str
+    value: str = ""
+    revision: int = 0
+
+
 def answer_keyboard(task_id: str, options: list[str]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for index, option in enumerate(options):
@@ -173,6 +185,152 @@ def explain_keyboard(task_id: str) -> InlineKeyboardMarkup:
                     text="Объяснить",
                     callback_data=ExplainCallback(task_id=task_id).pack(),
                 )
+            ]
+        ]
+    )
+
+
+def grading_failure_keyboard(task_id: str, evaluation_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="↻ Проверить снова",
+                    callback_data=GradeCallback(
+                        task_id=task_id,
+                        evaluation_id=evaluation_id,
+                        action="retry",
+                    ).pack(),
+                ),
+                InlineKeyboardButton(
+                    text="❌ Засчитать неверным",
+                    callback_data=GradeCallback(
+                        task_id=task_id,
+                        evaluation_id=evaluation_id,
+                        action="wrong",
+                    ).pack(),
+                ),
+            ]
+        ]
+    )
+
+
+def reminder_keyboard(policy: dict) -> InlineKeyboardMarkup:
+    revision = int(policy["revision"])
+    mode = "off" if policy["mode"] == "smart" else "smart"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔕 Выключить" if policy["mode"] == "smart" else "🔔 Включить",
+                    callback_data=ReminderCallback(
+                        action="mode", value=mode, revision=revision
+                    ).pack(),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Дни",
+                    callback_data=ReminderCallback(action="days", revision=revision).pack(),
+                ),
+                InlineKeyboardButton(
+                    text="Окно",
+                    callback_data=ReminderCallback(action="window", revision=revision).pack(),
+                ),
+                InlineKeyboardButton(
+                    text="Частота",
+                    callback_data=ReminderCallback(action="frequency", revision=revision).pack(),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="↻ Перепланировать",
+                    callback_data=ReminderCallback(action="replan", revision=revision).pack(),
+                )
+            ],
+        ]
+    )
+
+
+def reminder_days_keyboard(days_mask: int, revision: int) -> InlineKeyboardMarkup:
+    labels = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+    buttons = [
+        InlineKeyboardButton(
+            text=("✅ " if days_mask & (1 << index) else "▫️ ") + label,
+            callback_data=ReminderCallback(
+                action="day", value=str(index), revision=revision
+            ).pack(),
+        )
+        for index, label in enumerate(labels)
+    ]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            buttons[:4],
+            buttons[4:],
+            [
+                InlineKeyboardButton(
+                    text="Готово",
+                    callback_data=ReminderCallback(
+                        action="days_done", revision=revision
+                    ).pack(),
+                ),
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data=ReminderCallback(
+                        action="cancel", revision=revision
+                    ).pack(),
+                ),
+            ],
+        ]
+    )
+
+
+def reminder_frequency_keyboard(revision: int) -> InlineKeyboardMarkup:
+    values = (("Раз в день", 1440), ("2 ч", 120), ("3 ч", 180), ("4 ч", 240), ("6 ч", 360))
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=label,
+                callback_data=ReminderCallback(
+                    action="cadence", value=str(value), revision=revision
+                ).pack(),
+            )
+        ]
+        for label, value in values
+    ]
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Другое…",
+                callback_data=ReminderCallback(
+                    action="cadence_custom", revision=revision
+                ).pack(),
+            ),
+            InlineKeyboardButton(
+                text="Отмена",
+                callback_data=ReminderCallback(action="cancel", revision=revision).pack(),
+            ),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def reminder_confirmation_keyboard(revision: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Подтвердить",
+                    callback_data=ReminderCallback(
+                        action="confirm", revision=revision
+                    ).pack(),
+                ),
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data=ReminderCallback(
+                        action="cancel", revision=revision
+                    ).pack(),
+                ),
             ]
         ]
     )

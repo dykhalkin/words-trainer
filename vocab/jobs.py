@@ -12,6 +12,7 @@ from . import db
 JOB_NAMES = (
     "push",
     "curator_plan",
+    "reminder_refresh",
     "weekly_digest",
     "task_sweep",
     "session_cleanup",

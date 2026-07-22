@@ -16,6 +16,7 @@ from . import db
 from .languages import (
     CardValidationError,
     normalize_deck_name,
+    normalize_language_code,
     normalize_lemma,
     normalize_spaces,
     validate_word,
@@ -87,6 +88,7 @@ class WordCard(BaseModel):
 
 
 def validate_card(language: str, fields: dict[str, Any] | WordCard) -> tuple[WordCard, list[str]]:
+    language = normalize_language_code(language)
     card = fields if isinstance(fields, WordCard) else WordCard.model_validate(fields)
     warnings = validate_word(card.to_word(), language, strict_agent=True)
     return card, warnings
@@ -95,6 +97,7 @@ def validate_card(language: str, fields: dict[str, Any] | WordCard) -> tuple[Wor
 async def _ensure_general_deck(
     conn: AsyncConnection[dict[str, Any]], user_id: int, language: str
 ) -> dict[str, Any]:
+    language = normalize_language_code(language)
     result = await conn.execute(
         """INSERT INTO decks(user_id, language, name, normalized_name, is_general)
            VALUES (%s, %s, %s, %s, true)
@@ -115,6 +118,7 @@ async def ensure_general_deck(database: db.Database, user_id: int, language: str
 async def _ensure_archive_deck(
     conn: AsyncConnection[dict[str, Any]], user_id: int, language: str
 ) -> dict[str, Any]:
+    language = normalize_language_code(language)
     result = await conn.execute(
         """INSERT INTO decks(
                user_id, language, name, normalized_name, is_archive
@@ -142,6 +146,7 @@ async def bootstrap_user(
     timezone: str = "Europe/Berlin",
     llm_monthly_cap_usd: float = 20.0,
 ) -> dict[str, Any]:
+    language = normalize_language_code(language)
     async with database.connection() as conn:
         async with conn.transaction():
             result = await conn.execute(
@@ -155,6 +160,14 @@ async def bootstrap_user(
             )
             user = await result.fetchone()
             await _ensure_general_deck(conn, user["id"], language)
+            await conn.execute(
+                """INSERT INTO reminder_policies(
+                       user_id, mode, days_mask, window_start, window_end,
+                       target_interval_minutes, revision, planning_generation
+                   ) VALUES (%s, 'off', 127, '09:00', '21:00', 180, 1, 1)
+                   ON CONFLICT(user_id) DO NOTHING""",
+                (user["id"],),
+            )
             return user
 
 
@@ -175,6 +188,7 @@ async def list_users(database: db.Database) -> list[dict[str, Any]]:
 async def create_deck(
     database: db.Database, user_id: int, language: str, name: str
 ) -> dict[str, Any]:
+    language = normalize_language_code(language)
     name = normalize_spaces(name)
     if normalize_deck_name(name) in RESERVED_DECK_NAMES:
         raise ValueError("General and Archive are reserved deck names")
@@ -192,6 +206,7 @@ async def create_deck(
 async def _find_deck(
     conn: AsyncConnection[dict[str, Any]], user_id: int, deck: int | str, language: str | None = None
 ) -> dict[str, Any] | None:
+    language = normalize_language_code(language) if language else None
     if isinstance(deck, int):
         return await db.fetch_one(
             conn, "SELECT * FROM decks WHERE user_id = %s AND id = %s", (user_id, deck)
@@ -302,6 +317,7 @@ async def _insert_or_reuse_word(
     word: Word,
     move_existing: bool = False,
 ) -> tuple[dict[str, Any], bool]:
+    language = normalize_language_code(language)
     validate_word(word, language, strict_agent=False)
     key = normalize_lemma(language, word.lemma)
     existing = await db.fetch_one(
@@ -357,6 +373,7 @@ async def add_word(
 async def get_word(
     database: db.Database, user_id: int, query: int | str, language: str | None = None
 ) -> Word | None:
+    language = normalize_language_code(language) if language else None
     async with database.connection() as conn:
         if isinstance(query, int):
             row = await db.fetch_one(
@@ -386,6 +403,7 @@ async def _find_word_row(
     *,
     for_update: bool = False,
 ) -> dict[str, Any] | None:
+    language = normalize_language_code(language) if language else None
     lock = " FOR UPDATE" if for_update else ""
     if isinstance(query, int) or (isinstance(query, str) and query.isdigit()):
         return await db.fetch_one(
@@ -436,6 +454,12 @@ async def archive_word(
                    WHERE user_id = %s AND word_id = %s AND status = 'open'""",
                 (user_id, row["id"]),
             )
+            await conn.execute(
+                """UPDATE answer_evaluations e SET status = 'discarded', finished_at = now()
+                   FROM tasks t WHERE e.task_id = t.id AND e.status = 'pending'
+                     AND t.user_id = %s AND t.word_id = %s""",
+                (user_id, row["id"]),
+            )
             return updated
 
 
@@ -483,6 +507,12 @@ async def flag_word(
             await conn.execute(
                 """UPDATE tasks SET status = 'voided', voided_at = now()
                    WHERE user_id = %s AND word_id = %s AND status = 'open'""",
+                (user_id, row["id"]),
+            )
+            await conn.execute(
+                """UPDATE answer_evaluations e SET status = 'discarded', finished_at = now()
+                   FROM tasks t WHERE e.task_id = t.id AND e.status = 'pending'
+                     AND t.user_id = %s AND t.word_id = %s""",
                 (user_id, row["id"]),
             )
             return updated
@@ -578,6 +608,11 @@ async def archive_task_word(
                    WHERE id = %s""",
                 (task_id,),
             )
+            await conn.execute(
+                """UPDATE answer_evaluations SET status = 'discarded', finished_at = now()
+                   WHERE task_id = %s AND status = 'pending'""",
+                (task_id,),
+            )
             return {"task_id": task_id, "word_id": word["id"], "word": word["lemma"], **updated}
 
 
@@ -606,6 +641,11 @@ async def flag_task_word(
                    WHERE id = %s""",
                 (task_id,),
             )
+            await conn.execute(
+                """UPDATE answer_evaluations SET status = 'discarded', finished_at = now()
+                   WHERE task_id = %s AND status = 'pending'""",
+                (task_id,),
+            )
             return {"task_id": task_id, "word_id": word["id"], "word": word["lemma"], **updated}
 
 
@@ -617,6 +657,7 @@ async def stage_cards(
     deck_name: str,
     cards: list[dict[str, Any] | WordCard],
 ) -> dict[str, Any]:
+    language = normalize_language_code(language)
     if normalize_deck_name(deck_name) in RESERVED_DECK_NAMES:
         raise ValueError("General and Archive are reserved deck names")
     validated = [validate_card(language, card)[0] for card in cards]

@@ -56,7 +56,7 @@ class NewFeatureTests(unittest.IsolatedAsyncioTestCase):
             self.database,
             self.owner["id"],
             word_id=row["id"],
-            task_type="flashcard_de_ru",
+            task_type="flashcard_ru_de",
         )
         archived = await words.archive_task_word(
             self.database, self.owner["id"], task["task_id"]
@@ -78,10 +78,10 @@ class NewFeatureTests(unittest.IsolatedAsyncioTestCase):
             self.database,
             self.owner["id"],
             word_id=row["id"],
-            task_type="flashcard_de_ru",
+            task_type="flashcard_ru_de",
         )
         await scheduler.submit_answer(
-            self.database, self.owner["id"], task["task_id"], "мазь"
+            self.database, self.owner["id"], task["task_id"], "salbe"
         )
         await words.flag_word(self.database, self.owner["id"], row["id"], reason="typo")
         issue = (await words.list_word_issues(self.database, self.owner["id"]))[0]
@@ -117,11 +117,11 @@ class NewFeatureTests(unittest.IsolatedAsyncioTestCase):
             self.database,
             self.owner["id"],
             word_id=row["id"],
-            task_type="flashcard_de_ru",
+            task_type="flashcard_ru_de",
         )
         answer, archived = await asyncio.gather(
             scheduler.submit_answer(
-                self.database, self.owner["id"], task["task_id"], "оставаться"
+                self.database, self.owner["id"], task["task_id"], "bleiben"
             ),
             words.archive_task_word(self.database, self.owner["id"], task["task_id"]),
         )
@@ -172,10 +172,10 @@ class NewFeatureTests(unittest.IsolatedAsyncioTestCase):
                 self.database,
                 self.owner["id"],
                 word_id=row["id"],
-                task_type="flashcard_de_ru",
+                task_type="flashcard_ru_de",
             )
             await scheduler.submit_answer(
-                self.database, self.owner["id"], task["task_id"], "сегодня"
+                self.database, self.owner["id"], task["task_id"], "heute"
             )
             async with self.database.connection() as conn:
                 saved = await db.fetch_one(

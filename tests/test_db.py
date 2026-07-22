@@ -26,6 +26,9 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
                     {"version": "003_agent_history.sql"},
                     {"version": "004_word_disposition_and_review_deck.sql"},
                     {"version": "005_job_control.sql"},
+                    {"version": "006_target_language_grading_and_reminders.sql"},
+                    {"version": "007_canonical_language_codes.sql"},
+                    {"version": "008_complete_grading_reminder_schema.sql"},
                 ],
             )
 

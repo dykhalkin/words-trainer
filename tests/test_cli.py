@@ -9,6 +9,7 @@ from pathlib import Path
 
 import cli
 from tests.support import temporary_database
+from vocab import reminders
 
 
 class CliManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -81,7 +82,7 @@ class CliManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(archived["deck_id"], source_deck["id"])
 
         job_list = await self.invoke("job", "list")
-        self.assertEqual(len(job_list["jobs"]), 5)
+        self.assertEqual(len(job_list["jobs"]), 6)
         await self.invoke("job", "disable", "push")
         rejected = await self.invoke("job", "run", "push", succeeds=False)
         self.assertIn("disabled", rejected["error"])
@@ -131,6 +132,24 @@ class CliManagerTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(command=command), self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
                 parser.parse_args([command])
+
+    async def test_timezone_replans_without_exposing_legacy_reminder_flags(self) -> None:
+        await self.invoke("migrate")
+        bootstrapped = await self.invoke(
+            "user", "bootstrap", "--owner-chat-id", "101"
+        )
+        user_id = bootstrapped["users"][0]["id"]
+        before = await reminders.get_policy(self.database, user_id)
+        await self.invoke("user", "settings", "--timezone", "UTC")
+        after = await reminders.get_policy(self.database, user_id)
+        self.assertEqual(after["timezone"], "UTC")
+        self.assertEqual(after["revision"], before["revision"] + 1)
+        self.assertEqual(after["window_start"], before["window_start"])
+        self.assertEqual(after["window_end"], before["window_end"])
+        parser = cli.build_parser()
+        for flag in ("--quiet-start", "--quiet-end", "--min-push-interval"):
+            with self.subTest(flag=flag), self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                parser.parse_args(["user", "settings", flag, "1"])
 
 
 if __name__ == "__main__":

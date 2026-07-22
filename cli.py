@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from vocab import db, jobs, scheduler, statistics, storage, words
+from vocab import db, jobs, reminders, scheduler, statistics, storage, words
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("WORDS_DATA", ROOT / "data"))
@@ -72,9 +72,6 @@ async def command_user(database: db.Database, args: argparse.Namespace) -> Any:
         key: value
         for key, value in {
             "timezone": args.timezone,
-            "min_push_interval_minutes": args.min_push_interval,
-            "quiet_start": args.quiet_start,
-            "quiet_end": args.quiet_end,
             "daily_new_limit": args.daily_new_limit,
             "llm_monthly_cap_usd": args.llm_cap,
         }.items()
@@ -88,7 +85,12 @@ async def command_user(database: db.Database, args: argparse.Namespace) -> Any:
             f"UPDATE users SET {assignments}, updated_at = now() WHERE id = %s RETURNING *",
             (*updates.values(), user["id"]),
         )
-        return await result.fetchone()
+        updated = await result.fetchone()
+    if "timezone" in updates:
+        # Timezone is stored on users, but it changes the effective reminder
+        # policy and therefore must invalidate the current plan generation.
+        await reminders.update_policy(database, user["id"])
+    return updated
 
 
 async def command_deck(database: db.Database, args: argparse.Namespace) -> Any:
@@ -302,9 +304,6 @@ def build_parser() -> argparse.ArgumentParser:
     user_sub.add_parser("list")
     settings = user_sub.add_parser("settings")
     settings.add_argument("--timezone")
-    settings.add_argument("--min-push-interval", type=int)
-    settings.add_argument("--quiet-start")
-    settings.add_argument("--quiet-end")
     settings.add_argument("--daily-new-limit", type=int)
     settings.add_argument("--llm-cap", type=float)
 

@@ -1,23 +1,22 @@
 """Exercise generators and answer checkers.
 
-Each module exposes:
-    await generate(word, conn, rng, context) -> (payload, expected) | None
+Each registered generator exposes:
+    await generate(word, conn, rng, context) -> GeneratedExercise | None
     check(expected, answer)   -> CheckResult
 
-payload  — what the user sees (prompt, options, ...), JSON-safe
-expected — internal data needed to grade the answer, JSON-safe
+The result explicitly declares response mode, answer language, and grading policy in
+addition to the visible payload and server-side expected data.
 """
 
 from . import choice, cloze, flashcard, grammar
-from .base import CheckResult
+from .base import CheckResult, GeneratedExercise
 from ..languages import ExerciseContext
 
 GENERATORS = {
     "choice": choice,
-    "flashcard_de_ru": flashcard.DeRu,
     "flashcard_ru_de": flashcard.RuDe,
     "cloze": cloze,
     "grammar": grammar,
 }
 
-__all__ = ["GENERATORS", "CheckResult", "ExerciseContext"]
+__all__ = ["GENERATORS", "CheckResult", "GeneratedExercise", "ExerciseContext"]

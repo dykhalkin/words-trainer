@@ -8,11 +8,13 @@ from zoneinfo import ZoneInfo
 
 from psycopg.types.json import Jsonb
 
-from . import db
+from . import db, reminders
 
 
 async def analyze(database: db.Database, user_id: int) -> dict[str, Any]:
     """Compute model input without granting the curator arbitrary query tools."""
+    generated_at = datetime.now(timezone.utc)
+    horizon_end = generated_at + reminders.PLANNING_HORIZON
     async with database.connection() as conn:
         learner = await db.fetch_one(
             conn, "SELECT id, timezone FROM users WHERE id = %s", (user_id,)
@@ -66,6 +68,44 @@ async def analyze(database: db.Database, user_id: int) -> dict[str, Any]:
                ORDER BY r.created_at DESC LIMIT 50""",
             (user_id,),
         )
+        reminder_policy = await db.fetch_one(
+            conn,
+            """SELECT rp.*, u.timezone FROM reminder_policies rp
+               JOIN users u ON u.id = rp.user_id WHERE rp.user_id = %s""",
+            (user_id,),
+        )
+        due_forecast = await reminders.due_forecast(
+            conn, user_id, horizon_end
+        )
+        upcoming_deliveries = await db.fetch_all(
+            conn,
+            """SELECT scheduled_for, source, status FROM deliveries
+               WHERE user_id = %s AND kind = 'push' AND status = 'scheduled'
+               ORDER BY scheduled_for LIMIT 12""",
+            (user_id,),
+        )
+        delivery_outcomes = await db.fetch_all(
+            conn,
+            """SELECT status, scheduled_for, sent_at, skip_reason
+               FROM deliveries WHERE user_id = %s AND kind = 'push'
+                 AND status IN ('sent', 'skipped', 'failed')
+               ORDER BY coalesce(sent_at, claimed_at, scheduled_for) DESC LIMIT 20""",
+            (user_id,),
+        )
+        recent_activity = await db.fetch_one(
+            conn,
+            """SELECT max(created_at) AS last_review_at,
+                      count(*) FILTER (WHERE created_at >= now() - interval '24 hours')::int
+                          AS reviews_24h
+               FROM reviews WHERE user_id = %s""",
+            (user_id,),
+        )
+        active_session = await db.fetch_one(
+            conn,
+            """SELECT kind, last_activity_at FROM sessions
+               WHERE user_id = %s AND status = 'open'""",
+            (user_id,),
+        )
     streaks: dict[int, int] = {}
     closed: set[int] = set()
     for row in recent:
@@ -76,9 +116,24 @@ async def analyze(database: db.Database, user_id: int) -> dict[str, Any]:
             closed.add(word_id)
         else:
             streaks[word_id] = streaks.get(word_id, 0) + 1
+    zone = ZoneInfo(learner["timezone"])
+    planning_constraints = None
+    if reminder_policy:
+        planning_constraints = {
+            "horizon_start_utc": generated_at,
+            "horizon_end_utc": horizon_end,
+            "horizon_start_local": generated_at.astimezone(zone),
+            "horizon_end_local": horizon_end.astimezone(zone),
+            "freeze_until_utc": generated_at + reminders.FREEZE_WINDOW,
+            "minimum_gap_minutes": reminder_policy["target_interval_minutes"],
+            "maximum_sends_per_policy_day": reminders.daily_cap(reminder_policy),
+            "allowed_suppression_reasons": sorted(
+                reminders.ALLOWED_SUPPRESSION_REASONS
+            ),
+        }
     return {
         "user_id": user_id,
-        "generated_at": datetime.now(timezone.utc),
+        "generated_at": generated_at,
         "hard_words": hard_words,
         "accuracy_by_exercise": [
             {
@@ -94,6 +149,14 @@ async def analyze(database: db.Database, user_id: int) -> dict[str, Any]:
             {"word_id": word_id, "consecutive_errors": count}
             for word_id, count in sorted(streaks.items(), key=lambda item: (-item[1], item[0]))
         ],
+        "reminder_policy": reminder_policy,
+        "planning_constraints": planning_constraints,
+        "due_forecast": due_forecast,
+        "eligible_word_ids": [row["word_id"] for row in due_forecast],
+        "upcoming_deliveries": upcoming_deliveries,
+        "delivery_outcomes": delivery_outcomes,
+        "recent_activity": recent_activity,
+        "active_session": active_session,
     }
 
 
@@ -106,17 +169,32 @@ async def local_run_date(database: db.Database, user_id: int):
 
 
 async def save_plan(
-    database: db.Database, user_id: int, kind: str, plan: dict[str, Any]
+    database: db.Database,
+    user_id: int,
+    kind: str,
+    plan: dict[str, Any],
+    *,
+    input_revision: int = 1,
+    planning_generation: int = 1,
 ) -> dict[str, Any]:
     run_date = await local_run_date(database, user_id)
     async with database.connection() as conn:
         result = await conn.execute(
-            """INSERT INTO curator_plans(user_id, run_date, kind, plan)
-               VALUES (%s, %s, %s, %s)
-               ON CONFLICT(user_id, run_date, kind) DO UPDATE SET
+            """INSERT INTO curator_plans(
+                   user_id, run_date, kind, plan, input_revision, planning_generation
+               ) VALUES (%s, %s, %s, %s, %s, %s)
+               ON CONFLICT(user_id, run_date, kind, input_revision, planning_generation)
+               DO UPDATE SET
                    plan = EXCLUDED.plan, created_at = now()
                RETURNING *""",
-            (user_id, run_date, kind, Jsonb(plan)),
+            (
+                user_id,
+                run_date,
+                kind,
+                Jsonb(plan),
+                input_revision,
+                planning_generation,
+            ),
         )
         return await result.fetchone()
 

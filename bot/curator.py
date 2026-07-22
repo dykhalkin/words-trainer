@@ -6,13 +6,13 @@ import json
 import logging
 import os
 from decimal import Decimal
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 from agents import Agent, RunConfig, Runner
 from aiogram import Bot
 from pydantic import BaseModel, ConfigDict, Field
 
-from vocab import curator, db, llm, scheduler, words
+from vocab import curator, db, llm, reminders, scheduler, words
 
 from .config import Settings
 
@@ -25,13 +25,41 @@ class FocusItem(BaseModel):
     reason: str = Field(min_length=1)
 
 
-class CuratorOutput(BaseModel):
+class ReminderDirective(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    local_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    local_time: str = Field(pattern=r"^\d{2}:\d{2}$")
+    word_ids: list[int] = Field(max_length=5)
+    text: str = Field(min_length=1, max_length=500)
+
+
+class CuratorPlanOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    focus: list[FocusItem] = Field(max_length=10)
+    reminders: list[ReminderDirective] = Field(max_length=12)
+    suppression_reason: Literal[
+        "no_due", "recent_practice", "active_session", "low_due_load", "recently_ignored"
+    ] | None
+
+
+class CuratorDigestOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     focus: list[FocusItem] = Field(max_length=10)
     digest: str = Field(min_length=1, max_length=2000)
 
 
-CURATOR_INSTRUCTIONS = """You are a vocabulary-learning curator.
+CURATOR_PLAN_INSTRUCTIONS = """You are a vocabulary-learning curator.
+Use only word IDs present in the supplied deterministic analysis.
+Prioritize due words, repeated errors, and weak exercise types.
+Choose exact local reminder dates and five-minute-rounded times only inside the supplied policy
+and the explicit planning_constraints horizon. Never schedule before freeze_until_utc.
+Never exceed minimum_gap_minutes or maximum_sends_per_policy_day. You may schedule fewer
+reminders only when deterministic input supports the chosen suppression reason. Return concise
+Russian notification text.
+You cannot grade answers or modify progress.
+"""
+
+CURATOR_DIGEST_INSTRUCTIONS = """You are a vocabulary-learning curator.
 Use only word IDs present in the supplied deterministic analysis.
 Prioritize repeated errors and weak exercise types. Return a short Russian digest.
 You cannot grade answers or modify progress.
@@ -54,22 +82,37 @@ class CuratorService:
     ) -> dict[str, Any] | None:
         if kind not in {"plan", "digest"}:
             raise ValueError("curator kind must be plan or digest")
+        policy = await reminders.get_policy(database, learner["id"])
+        input_revision = policy["revision"] if kind == "plan" and policy else 1
+        planning_generation = (
+            policy["planning_generation"] if kind == "plan" and policy else 1
+        )
+        if kind == "plan" and (not policy or policy["mode"] != "smart"):
+            return None
         run_date = await curator.local_run_date(database, learner["id"])
         async with database.connection() as conn:
             existing = await db.fetch_one(
                 conn,
                 """SELECT * FROM curator_plans
-                   WHERE user_id = %s AND run_date = %s AND kind = %s""",
-                (learner["id"], run_date, kind),
+                   WHERE user_id = %s AND run_date = %s AND kind = %s
+                     AND input_revision = %s AND planning_generation = %s""",
+                (
+                    learner["id"], run_date, kind, input_revision, planning_generation
+                ),
             )
             if existing:
                 return existing
             started = await conn.execute(
-                """INSERT INTO curator_runs(user_id, kind, status)
-                   VALUES (%s, %s, 'running') RETURNING id""",
-                (learner["id"], kind),
+                """INSERT INTO curator_runs(
+                       user_id, kind, status, input_revision, planning_generation
+                   ) VALUES (%s, %s, 'running', %s, %s)
+                   ON CONFLICT DO NOTHING RETURNING id""",
+                (learner["id"], kind, input_revision, planning_generation),
             )
-            run_id = (await started.fetchone())["id"]
+            started_row = await started.fetchone()
+            if not started_row:
+                return None
+            run_id = started_row["id"]
         usage_id: int | None = None
         api_started = False
         try:
@@ -84,9 +127,13 @@ class CuratorService:
             )
             agent = Agent(
                 name="Vocabulary curator",
-                instructions=CURATOR_INSTRUCTIONS,
+                instructions=(
+                    CURATOR_PLAN_INSTRUCTIONS
+                    if kind == "plan"
+                    else CURATOR_DIGEST_INSTRUCTIONS
+                ),
                 model=self.settings.curator_model,
-                output_type=CuratorOutput,
+                output_type=(CuratorPlanOutput if kind == "plan" else CuratorDigestOutput),
             )
             api_started = True
             result = await self.runner(
@@ -95,15 +142,25 @@ class CuratorService:
                 max_turns=2,
                 run_config=RunConfig(tracing_disabled=True, trace_include_sensitive_data=False),
             )
-            output = result.final_output_as(CuratorOutput, raise_if_incorrect_type=True)
-            allowed = {row["word_id"] for row in analysis["hard_words"]}
+            output_type = CuratorPlanOutput if kind == "plan" else CuratorDigestOutput
+            output = result.final_output_as(output_type, raise_if_incorrect_type=True)
+            allowed = {
+                *[row["word_id"] for row in analysis["hard_words"]],
+                *analysis["eligible_word_ids"],
+            }
             output.focus = [item for item in output.focus if item.word_id in allowed]
+            if isinstance(output, CuratorPlanOutput):
+                for directive in output.reminders:
+                    directive.word_ids = [
+                        value for value in directive.word_ids if value in allowed
+                    ]
             usage = result.context_wrapper.usage
+            input_price, output_price = self.settings.prices_for("curator")
             actual = (
                 Decimal(usage.input_tokens)
-                * Decimal(str(self.settings.llm_input_usd_per_million))
+                * Decimal(str(input_price))
                 + Decimal(usage.output_tokens)
-                * Decimal(str(self.settings.llm_output_usd_per_million))
+                * Decimal(str(output_price))
             ) / Decimal(1_000_000)
             await llm.reconcile(
                 database,
@@ -112,7 +169,25 @@ class CuratorService:
                 output_tokens=usage.output_tokens,
                 actual_usd=actual,
             )
-            plan = await curator.save_plan(database, learner["id"], kind, output.model_dump())
+            plan = await curator.save_plan(
+                database,
+                learner["id"],
+                kind,
+                output.model_dump(),
+                input_revision=input_revision,
+                planning_generation=planning_generation,
+            )
+            if isinstance(output, CuratorPlanOutput):
+                try:
+                    await reminders.materialize_plan(
+                        database,
+                        learner["id"],
+                        [item.model_dump() for item in output.reminders],
+                        source="curator",
+                        suppression_reason=output.suppression_reason,
+                    )
+                except ValueError:
+                    await reminders.materialize_deterministic(database, learner["id"])
             async with database.connection() as conn:
                 await conn.execute(
                     """UPDATE curator_runs SET status = 'succeeded', finished_at = now()
@@ -130,12 +205,25 @@ class CuratorService:
                     (str(exc)[:1000], run_id),
                 )
             logger.warning("curator unavailable for learner %s: %s", learner["id"], exc)
+            if kind == "plan":
+                try:
+                    return await reminders.materialize_deterministic(
+                        database, learner["id"]
+                    )
+                except Exception:
+                    logger.exception(
+                        "deterministic reminder fallback failed for learner %s",
+                        learner["id"],
+                    )
             return None
 
 
 async def run_plan_cycle(service: CuratorService, database: db.Database) -> int:
     completed = 0
     for learner in await words.list_users(database):
+        await reminders.ensure_refresh(database, learner["id"])
+        if not await reminders.needs_refresh(database, learner["id"]):
+            continue
         if await service.run_for(database, learner):
             completed += 1
     return completed

@@ -10,7 +10,7 @@ from psycopg import AsyncConnection
 from .. import db
 from ..languages import ExerciseContext
 from ..models import Word
-from .base import CheckResult
+from .base import CheckResult, GeneratedExercise
 
 N_OPTIONS = 4
 
@@ -53,7 +53,7 @@ async def generate(
         "options": options,
     }
     expected = {"correct_index": correct_idx, "correct_text": word.translation}
-    return payload, expected
+    return GeneratedExercise(payload, expected, "choice", None, "deterministic")
 
 
 def check(expected: dict, answer: str) -> CheckResult:

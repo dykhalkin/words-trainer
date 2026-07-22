@@ -7,7 +7,13 @@ description: Use when acting as or maintaining the learner-scoped AI tutor for t
 
 ## Invariants
 
-- The deterministic scheduler alone grades answers and writes progress/reviews.
+- Every typed exercise requires the studied language; never ask for a written
+  native-language translation.
+- Core checks button answers and normalized exact variants locally. A dedicated,
+  tool-free answer grader evaluates only free-text mismatches.
+- The conversational tutor and answer grader are separate roles. Neither writes
+  progress/reviews; only the transactional scheduler finalizes a schema-valid
+  structured grader verdict.
 - Every call is scoped to the resolved learner; never accept a model-supplied user ID.
 - An unanswered `task-context` must not contain `expected`.
 - AI-created cards are strict `WordCard` proposals in `pending_cards`; only the
@@ -24,7 +30,9 @@ no task, answer, session, or push-delivery commands.
 |---|---|
 | Next exercise | `scheduler.create_task` |
 | New / learning / review | `create_task` queue argument |
-| Grade once | `scheduler.submit_answer` |
+| Begin answer | `scheduler.begin_answer_submission` |
+| Finalize semantic verdict | `scheduler.finalize_tutor_evaluation` |
+| Record grader failure | `scheduler.fail_tutor_evaluation` |
 | Safe task context | `scheduler.task_context` |
 | Word card | `words.get_word` |
 | Stats | `statistics.stats` |
@@ -40,10 +48,15 @@ The tutor's only write tool is a staged proposal.
 
 Telegram routes command → callback → persisted pending typed task → tutor chat.
 For an issued task show prompt/options/hint only, preserve its exact ID, call
-`submit_answer` once, then explain the returned verdict without overriding it.
+`begin_answer_submission` once, and explain a deterministic verdict without
+overriding it. If it returns a pending evaluation, the bot—not the conversational
+tutor—calls the dedicated grader outside the database transaction. Reveal the
+canonical answer and update SRS only after core finalization.
 
 ## Failure behavior
 
-OpenAI failures or budget exhaustion disable chat, explanations, and curator
-generation only. Deterministic drills, grading, sessions, and fallback push
-composition continue to work.
+OpenAI failures or budget exhaustion disable chat and explanations. Exact and
+button answers still complete locally. A mismatched free-text answer remains
+open without a review or progress change and offers retry, answer editing, or an
+explicit learner override. Curator failures use validated due-only reminder
+fallback inside the learner's policy.

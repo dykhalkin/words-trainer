@@ -25,6 +25,7 @@ class BotJobRunner:
         self.registry: dict[str, Job] = {
             "push": lambda: run_push_cycle(bot, database),
             "curator_plan": lambda: run_plan_cycle(curator, database),
+            "reminder_refresh": lambda: run_plan_cycle(curator, database),
             "weekly_digest": lambda: run_digest_cycle(curator, bot, database),
             "task_sweep": lambda: scheduler.sweep_expired(database),
             "session_cleanup": lambda: scheduler.close_idle_sessions(database),
