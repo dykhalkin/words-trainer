@@ -140,6 +140,34 @@ class NewFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(archived is not None, state["is_archive"])
         self.assertEqual("error" not in answer, state["status"] == "answered")
 
+    async def test_answered_card_can_be_archived_without_removing_review(self) -> None:
+        row = await self.add("später", "позже")
+        task = await scheduler.create_task(
+            self.database,
+            self.owner["id"],
+            word_id=row["id"],
+            task_type="flashcard_ru_de",
+        )
+        assert task is not None
+        verdict = await scheduler.submit_answer(
+            self.database, self.owner["id"], task["task_id"], "später"
+        )
+        self.assertTrue(verdict["correct"])
+        archived = await words.archive_answered_task_word(
+            self.database, self.owner["id"], task["task_id"]
+        )
+        self.assertIsNotNone(archived)
+        async with self.database.connection() as conn:
+            state = await db.fetch_one(
+                conn,
+                """SELECT d.is_archive,
+                          (SELECT count(*)::int FROM reviews WHERE task_id = %s) AS reviews
+                   FROM words w JOIN decks d ON d.id = w.deck_id WHERE w.id = %s""",
+                (task["task_id"], row["id"]),
+            )
+        self.assertTrue(state["is_archive"])
+        self.assertEqual(state["reviews"], 1)
+
     async def test_session_scope_validation_and_archive_exclusion(self) -> None:
         first = await self.add("eins", "один", self.a2["id"])
         second = await self.add("zwei", "два", self.doctor["id"])

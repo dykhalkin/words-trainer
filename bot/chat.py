@@ -9,10 +9,10 @@ from typing import Any
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, Message
 
-from vocab import db, llm, scheduler, words
+from vocab import db, llm, reminders, scheduler, words
 
 from .agent import TutorService
-from .drill import finish_answer
+from .drill import finish_answer, send_task
 from .grader import TutorGraderService
 from .keyboards import ExplainCallback, PendingCallback, pending_keyboard
 from .reminders import handle_pending_text
@@ -61,6 +61,82 @@ async def send_tutor_reply(
             )
 
 
+async def _resume_training_if_needed(
+    message: Message, database: db.Database, learner: dict[str, Any]
+) -> None:
+    if (
+        not await scheduler.get_open_task(database, learner["id"])
+        and await scheduler.get_open_session(database, learner["id"])
+    ):
+        await send_task(message, database, learner)
+
+
+async def handle_card_feedback(
+    message: Message,
+    database: db.Database,
+    learner: dict[str, Any],
+    tutor: TutorService,
+) -> bool:
+    pending = await reminders.get_pending_action(database, learner["id"])
+    if not pending or pending["kind"] != "card_feedback":
+        return False
+    feedback = (message.text or "").strip()
+    if len(feedback) < 3:
+        await message.answer("Опишите, что именно неверно в карточке, чуть подробнее.")
+        return True
+    if len(feedback) > 2000:
+        await message.answer("Комментарий слишком длинный. Сократите его до 2000 символов.")
+        return True
+    await reminders.clear_pending_action(database, learner["id"])
+    task_id = str(pending["payload"]["task_id"])
+    flagged = await words.flag_answered_task_word(
+        database,
+        learner["id"],
+        task_id,
+        reason=feedback,
+    )
+    if not flagged:
+        await message.answer("Карточка или контекст упражнения уже недоступны.")
+        return True
+    if not tutor.available:
+        await message.answer(
+            "Комментарий сохранён, карточка исключена из тренировок. "
+            "Tutor сейчас недоступен, поэтому она осталась в списке /issues."
+        )
+        await _resume_training_if_needed(message, database, learner)
+        return True
+    status = await message.answer("Tutor проверяет комментарий и исправляет карточку…")
+    try:
+        correction = await tutor.correct_card(
+            database,
+            learner,
+            task_id=task_id,
+            feedback=feedback,
+        )
+    except llm.BudgetExceeded:
+        await status.edit_text(
+            "Комментарий сохранён, но лимит tutor исчерпан. "
+            "Карточка осталась в списке /issues."
+        )
+        await _resume_training_if_needed(message, database, learner)
+        return True
+    except Exception:
+        logger.exception("card correction failed")
+        await status.edit_text(
+            "Комментарий сохранён, но tutor не смог обновить карточку. "
+            "Она осталась в списке /issues."
+        )
+        await _resume_training_if_needed(message, database, learner)
+        return True
+    card = correction.corrected_card
+    await status.edit_text(
+        f"Карточка обновлена: {card.lemma} — {card.translation}\n"
+        f"{correction.summary_ru}"
+    )
+    await _resume_training_if_needed(message, database, learner)
+    return True
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def text_answer_or_chat(
     message: Message,
@@ -69,6 +145,8 @@ async def text_answer_or_chat(
     tutor: TutorService,
     grader: TutorGraderService,
 ) -> None:
+    if await handle_card_feedback(message, database, learner, tutor):
+        return
     task = await scheduler.get_open_task(database, learner["id"])
     if task:
         await finish_answer(

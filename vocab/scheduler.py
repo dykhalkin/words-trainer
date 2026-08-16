@@ -670,6 +670,7 @@ async def task_context(
         return None
     output = {
         "task_id": row["id"],
+        "word_id": row["word_id"],
         "status": row["status"],
         "type": row["type"],
         "response_mode": row["response_mode"],

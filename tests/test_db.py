@@ -29,6 +29,7 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
                     {"version": "006_target_language_grading_and_reminders.sql"},
                     {"version": "007_canonical_language_codes.sql"},
                     {"version": "008_complete_grading_reminder_schema.sql"},
+                    {"version": "009_card_feedback_corrections.sql"},
                 ],
             )
 

@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+import json
 import unittest
 from decimal import Decimal
+from types import SimpleNamespace
 
-from bot.agent import AgentConjugation, AgentWordCard, TOOLS
-from vocab import llm, words
+from pydantic import SecretStr
+
+from bot.agent import (
+    AgentConjugation,
+    AgentWordCard,
+    CardCorrectionOutput,
+    TOOLS,
+    TutorService,
+)
+from bot.config import Settings
+from vocab import db, llm, scheduler, words
+from vocab.models import Word
 from tests.support import temporary_database
 
 
@@ -58,6 +70,111 @@ class LlmPersistenceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(history), 20)
             self.assertEqual(history[0]["content"], "owner-5")
             self.assertNotIn("spouse-secret", {item["content"] for item in history})
+
+
+class CardCorrectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tutor_corrects_exact_answered_card_and_audits_feedback(self) -> None:
+        async with temporary_database() as database:
+            learner = await words.bootstrap_user(database, name="owner", chat_id=101)
+            deck = await words.create_deck(database, learner["id"], "de", "A2")
+            word, _ = await words.add_word(
+                database,
+                user_id=learner["id"],
+                language="de",
+                deck_id=deck["id"],
+                word=Word(
+                    lemma="morgen",
+                    kind="other",
+                    translation="вчера",
+                    example="Bis morgen.",
+                    pronunciation="морген",
+                    source_file="test",
+                ),
+            )
+            task = await scheduler.create_task(
+                database,
+                learner["id"],
+                word_id=word["id"],
+                task_type="flashcard_ru_de",
+            )
+            assert task is not None
+            await scheduler.submit_answer(
+                database, learner["id"], task["task_id"], "morgen"
+            )
+            await words.flag_answered_task_word(
+                database,
+                learner["id"],
+                task["task_id"],
+                reason="Перевод должен быть «завтра»",
+            )
+            corrected = AgentWordCard(
+                lemma="morgen",
+                kind="other",
+                translation="завтра",
+                example="Bis morgen.",
+                pronunciation="морген",
+                article=None,
+                singular=None,
+                plural_full=None,
+                conjugation=None,
+                verb=None,
+                preposition=None,
+                case=None,
+            )
+            calls: list[tuple] = []
+
+            class FakeResult:
+                context_wrapper = SimpleNamespace(
+                    usage=SimpleNamespace(input_tokens=100, output_tokens=20)
+                )
+
+                def final_output_as(self, output_type, *, raise_if_incorrect_type):
+                    return CardCorrectionOutput(
+                        corrected_card=corrected,
+                        summary_ru="Исправлен перевод.",
+                    )
+
+            async def runner(*args, **kwargs):
+                calls.append((args, kwargs))
+                return FakeResult()
+
+            service = TutorService(
+                Settings(
+                    TELEGRAM_BOT_TOKEN="token",
+                    DATABASE_URL="postgresql://unused",
+                    OWNER_CHAT_ID=101,
+                    OPENAI_API_KEY=SecretStr("test-key"),
+                    TUTOR_MODEL="tutor-test",
+                ),
+                runner=runner,
+            )
+            result = await service.correct_card(
+                database,
+                learner,
+                task_id=task["task_id"],
+                feedback="Перевод должен быть «завтра»",
+            )
+            self.assertEqual(result.corrected_card.translation, "завтра")
+            agent, payload = calls[0][0][:2]
+            self.assertEqual(agent.tools, [])
+            self.assertEqual(
+                json.loads(payload)["learner_feedback"],
+                "Перевод должен быть «завтра»",
+            )
+            async with database.connection() as conn:
+                stored = await db.fetch_one(
+                    conn, "SELECT * FROM words WHERE id = %s", (word["id"],)
+                )
+                audit = await db.fetch_one(
+                    conn,
+                    "SELECT * FROM card_corrections WHERE word_id = %s",
+                    (word["id"],),
+                )
+            self.assertEqual(stored["card_status"], "active")
+            self.assertEqual(stored["card"]["translation"], "завтра")
+            self.assertEqual(audit["feedback"], "Перевод должен быть «завтра»")
+            self.assertEqual(audit["original_card"]["translation"], "вчера")
+            self.assertEqual(audit["corrected_card"]["translation"], "завтра")
 
 
 if __name__ == "__main__":

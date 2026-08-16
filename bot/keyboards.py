@@ -57,26 +57,12 @@ class ReminderCallback(CallbackData, prefix="r"):
     revision: int = 0
 
 
-def answer_keyboard(task_id: str, options: list[str]) -> InlineKeyboardMarkup:
+def answer_keyboard(task_id: str, options: list[str]) -> InlineKeyboardMarkup | None:
     builder = InlineKeyboardBuilder()
     for index, option in enumerate(options):
         builder.button(text=option, callback_data=AnswerCallback(task_id=task_id, option=index))
     builder.adjust(1)
-    builder.row(
-        InlineKeyboardButton(
-            text="🗄 В архив",
-            callback_data=WordActionCallback(
-                task_id=task_id, action="archive", confirm=0
-            ).pack(),
-        ),
-        InlineKeyboardButton(
-            text="⚠️ Ошибка",
-            callback_data=WordActionCallback(
-                task_id=task_id, action="flag", confirm=0
-            ).pack(),
-        ),
-    )
-    return builder.as_markup()
+    return builder.as_markup() if options else None
 
 
 def confirm_word_action_keyboard(task_id: str, action: str) -> InlineKeyboardMarkup:
@@ -177,14 +163,26 @@ def start_keyboard(delivery_id: int = 0) -> InlineKeyboardMarkup:
     )
 
 
-def explain_keyboard(task_id: str) -> InlineKeyboardMarkup:
+def post_answer_keyboard(task_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="Объяснить",
                     callback_data=ExplainCallback(task_id=task_id).pack(),
-                )
+                ),
+                InlineKeyboardButton(
+                    text="🗄 В архив",
+                    callback_data=WordActionCallback(
+                        task_id=task_id, action="archive", confirm=0
+                    ).pack(),
+                ),
+                InlineKeyboardButton(
+                    text="⚠️ Ошибка",
+                    callback_data=WordActionCallback(
+                        task_id=task_id, action="flag", confirm=0
+                    ).pack(),
+                ),
             ]
         ]
     )

@@ -25,9 +25,9 @@ from .keyboards import (
     answer_keyboard,
     confirm_word_action_keyboard,
     deck_picker_keyboard,
-    explain_keyboard,
     grading_failure_keyboard,
     issues_keyboard,
+    post_answer_keyboard,
 )
 from .presentation import session_summary, stats_text, task_text, verdict_text
 
@@ -131,7 +131,7 @@ async def finish_answer(
             await status.edit_text("Упражнение уже изменилось; результат проверки отброшен.")
             return
         await status.edit_text(
-            verdict_text(verdict), reply_markup=explain_keyboard(task_id)
+            verdict_text(verdict), reply_markup=post_answer_keyboard(task_id)
         )
         edit = False
     else:
@@ -139,10 +139,10 @@ async def finish_answer(
         if edit:
             original = message.text or "Упражнение"
             await message.edit_text(
-                f"{original}\n\n{rendered}", reply_markup=explain_keyboard(task_id)
+                f"{original}\n\n{rendered}", reply_markup=post_answer_keyboard(task_id)
             )
         else:
-            await message.answer(rendered, reply_markup=explain_keyboard(task_id))
+            await message.answer(rendered, reply_markup=post_answer_keyboard(task_id))
     if verdict.get("session_complete"):
         await message.answer(
             session_summary(
@@ -176,7 +176,8 @@ async def resolve_grade_failure(
             return
         await callback.answer()
         await callback.message.edit_text(
-            verdict_text(verdict), reply_markup=explain_keyboard(callback_data.task_id)
+            verdict_text(verdict),
+            reply_markup=post_answer_keyboard(callback_data.task_id),
         )
         await send_task(callback.message, database, learner)
         return
@@ -392,15 +393,43 @@ async def word_action(
         await callback.answer()
         return
     context = await scheduler.task_context(database, learner["id"], callback_data.task_id)
-    if not context or context["status"] != "open":
+    if not context or context["status"] != "answered":
         await callback.answer("Упражнение уже неактивно")
         return
-    options = list(_payload(context["payload"]).get("options") or [])
     if callback_data.action == "cancel":
         await callback.answer()
         await callback.message.edit_reply_markup(
-            reply_markup=answer_keyboard(callback_data.task_id, options)
+            reply_markup=post_answer_keyboard(callback_data.task_id)
         )
+        return
+    if callback_data.action == "flag":
+        result = await words.flag_answered_task_word(
+            database,
+            learner["id"],
+            callback_data.task_id,
+            reason="Ожидается комментарий пользователя",
+        )
+        if not result:
+            await callback.answer("Карточка больше недоступна")
+            return
+        await reminders.set_pending_action(
+            database,
+            learner["id"],
+            "card_feedback",
+            {
+                "task_id": callback_data.task_id,
+                "word_id": context["word_id"],
+            },
+        )
+        await callback.answer()
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer(
+            f"Что нужно исправить в карточке «{context['word']}»? "
+            "Опишите ошибку одним сообщением."
+        )
+        return
+    if callback_data.action != "archive":
+        await callback.answer("Неизвестное действие")
         return
     if not callback_data.confirm:
         await callback.answer()
@@ -410,23 +439,18 @@ async def word_action(
             )
         )
         return
-    if callback_data.action == "archive":
-        result = await words.archive_task_word(
-            database, learner["id"], callback_data.task_id
-        )
-        message = "Карточка перенесена в архив."
-    elif callback_data.action == "flag":
-        result = await words.flag_task_word(
-            database, learner["id"], callback_data.task_id
-        )
-        message = "Карточка помечена для исправления."
-    else:
-        result = None
-        message = "Неизвестное действие."
+    result = await words.archive_answered_task_word(
+        database, learner["id"], callback_data.task_id
+    )
+    message = "Карточка перенесена в архив."
     if not result:
         await callback.answer("Упражнение уже неактивно")
         return
     await callback.answer()
     original = callback.message.text or "Упражнение"
     await callback.message.edit_text(f"{original}\n\n{message}", reply_markup=None)
-    await send_task(callback.message, database, learner)
+    if (
+        not await scheduler.get_open_task(database, learner["id"])
+        and await scheduler.get_open_session(database, learner["id"])
+    ):
+        await send_task(callback.message, database, learner)

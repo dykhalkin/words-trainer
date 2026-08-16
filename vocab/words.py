@@ -31,6 +31,10 @@ RESERVED_DECK_NAMES = {
 }
 
 
+def _card_object(value: Any) -> dict[str, Any]:
+    return json.loads(value) if isinstance(value, str) else dict(value or {})
+
+
 class WordCard(BaseModel):
     """Strict structured card schema used by the agent tool and DB validation."""
 
@@ -572,6 +576,132 @@ async def replace_word_card(
                 """UPDATE progress SET due_at = LEAST(COALESCE(due_at, now()), now()),
                           updated_at = now() WHERE word_id = %s""",
                 (word_id,),
+            )
+            updated["warnings"] = warnings
+            return updated
+
+
+async def archive_answered_task_word(
+    database: db.Database, user_id: int, task_id: str
+) -> dict[str, Any] | None:
+    """Archive the learner-owned word shown by an already answered task."""
+    async with database.connection() as conn:
+        async with conn.transaction():
+            task = await db.fetch_one(
+                conn,
+                """SELECT t.word_id, w.* FROM tasks t JOIN words w ON w.id = t.word_id
+                   WHERE t.id = %s AND t.user_id = %s AND t.status = 'answered'
+                   FOR UPDATE OF w""",
+                (task_id, user_id),
+            )
+            if not task:
+                return None
+            updated = await _archive_word_row(conn, task)
+            await conn.execute(
+                """UPDATE tasks SET status = 'voided', voided_at = now()
+                   WHERE user_id = %s AND word_id = %s AND status = 'open'""",
+                (user_id, task["word_id"]),
+            )
+            return {"task_id": task_id, "word_id": task["word_id"], **updated}
+
+
+async def flag_answered_task_word(
+    database: db.Database,
+    user_id: int,
+    task_id: str,
+    *,
+    reason: str,
+) -> dict[str, Any] | None:
+    """Mark the word from an answered task as unavailable pending correction."""
+    async with database.connection() as conn:
+        async with conn.transaction():
+            task = await db.fetch_one(
+                conn,
+                """SELECT t.word_id FROM tasks t JOIN words w ON w.id = t.word_id
+                   WHERE t.id = %s AND t.user_id = %s AND t.status = 'answered'
+                   FOR UPDATE OF w""",
+                (task_id, user_id),
+            )
+            if not task:
+                return None
+            result = await conn.execute(
+                """UPDATE words SET card_status = 'needs_fix', needs_fix_at = now(),
+                          needs_fix_reason = %s, needs_fix_task_id = %s, modified_at = now()
+                   WHERE id = %s AND user_id = %s RETURNING *""",
+                (reason, task_id, task["word_id"], user_id),
+            )
+            updated = await result.fetchone()
+            await conn.execute(
+                """UPDATE tasks SET status = 'voided', voided_at = now()
+                   WHERE user_id = %s AND word_id = %s AND status = 'open'""",
+                (user_id, task["word_id"]),
+            )
+            return updated
+
+
+async def apply_task_card_correction(
+    database: db.Database,
+    user_id: int,
+    task_id: str,
+    *,
+    feedback: str,
+    fields: dict[str, Any] | WordCard,
+    model: str,
+) -> dict[str, Any]:
+    """Validate, apply, and audit a tutor correction for an answered task."""
+    feedback = normalize_spaces(feedback)
+    if not feedback:
+        raise ValueError("card feedback is required")
+    async with database.connection() as conn:
+        async with conn.transaction():
+            row = await db.fetch_one(
+                conn,
+                """SELECT w.* FROM tasks t JOIN words w ON w.id = t.word_id
+                   WHERE t.id = %s AND t.user_id = %s AND t.status = 'answered'
+                   FOR UPDATE OF w""",
+                (task_id, user_id),
+            )
+            if not row:
+                raise LookupError("answered task not found")
+            card, warnings = validate_card(row["language"], fields)
+            word = card.to_word(source_file="tutor-correction")
+            key = normalize_lemma(row["language"], word.lemma)
+            corrected_card = db.word_to_card(word)
+            result = await conn.execute(
+                """UPDATE words SET lemma = %s, lemma_key = %s, kind = %s, card = %s,
+                          card_status = 'active', needs_fix_at = NULL,
+                          needs_fix_reason = NULL, needs_fix_task_id = NULL,
+                          modified_at = now()
+                   WHERE id = %s AND user_id = %s RETURNING *""",
+                (
+                    word.lemma,
+                    key,
+                    word.kind,
+                    Jsonb(corrected_card),
+                    row["id"],
+                    user_id,
+                ),
+            )
+            updated = await result.fetchone()
+            await conn.execute(
+                """UPDATE progress SET due_at = LEAST(COALESCE(due_at, now()), now()),
+                          updated_at = now() WHERE word_id = %s""",
+                (row["id"],),
+            )
+            await conn.execute(
+                """INSERT INTO card_corrections(
+                       user_id, word_id, task_id, feedback,
+                       original_card, corrected_card, model
+                   ) VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    user_id,
+                    row["id"],
+                    task_id,
+                    feedback,
+                    Jsonb(_card_object(row["card"])),
+                    Jsonb(corrected_card),
+                    model,
+                ),
             )
             updated["warnings"] = warnings
             return updated

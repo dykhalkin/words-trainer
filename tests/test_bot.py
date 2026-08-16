@@ -18,6 +18,7 @@ from bot.keyboards import (
     WordActionCallback,
     answer_keyboard,
     deck_picker_keyboard,
+    post_answer_keyboard,
 )
 from bot.middleware import LearnerMiddleware, update_chat
 from bot.presentation import session_summary, task_text, verdict_text
@@ -28,10 +29,24 @@ class BotPresentationTests(unittest.TestCase):
         packed = AnswerCallback(task_id="1234567890abcdef", option=3).pack()
         self.assertLessEqual(len(packed.encode()), 64)
         markup = answer_keyboard("1234567890abcdef", ["sehr langes sichtbares Wort"])
+        assert markup is not None
         callback_data = markup.inline_keyboard[0][0].callback_data
         self.assertNotIn("sichtbares", callback_data or "")
         typed_markup = answer_keyboard("1234567890abcdef", [])
-        self.assertEqual(len(typed_markup.inline_keyboard), 1)
+        self.assertIsNone(typed_markup)
+        pre_answer_labels = [
+            button.text for row in markup.inline_keyboard for button in row
+        ]
+        self.assertNotIn("🗄 В архив", pre_answer_labels)
+        self.assertNotIn("⚠️ Ошибка", pre_answer_labels)
+        post_answer_labels = [
+            button.text
+            for row in post_answer_keyboard("1234567890abcdef").inline_keyboard
+            for button in row
+        ]
+        self.assertEqual(
+            post_answer_labels, ["Объяснить", "🗄 В архив", "⚠️ Ошибка"]
+        )
         payloads = [
             PracticeDeckCallback(deck_id=123456789, page=99).pack(),
             StatsDeckCallback(deck_id=123456789, page=99).pack(),
