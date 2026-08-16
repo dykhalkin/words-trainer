@@ -7,7 +7,7 @@ env_file="${WORDSBOT_ENV_FILE:-$HOME/.config/wordsbot/env}"
 set -a
 source "$env_file"
 set +a
-backup_dir="${WORDSBOT_BACKUP_DIR:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/Wordsbot Backups}"
+backup_dir="${WORDSBOT_BACKUP_DIR:-$HOME/Library/Application Support/wordsbot/backups}"
 mkdir -p "$backup_dir"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 target="$backup_dir/words_trainer-$stamp.dump"

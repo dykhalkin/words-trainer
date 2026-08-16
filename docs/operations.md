@@ -13,7 +13,8 @@
 ## Backups
 
 `com.wordsbot.backup` runs a custom-format `pg_dump` daily at 03:15 and retains
-14 days in `~/Library/Mobile Documents/com~apple~CloudDocs/Wordsbot Backups`.
+14 days in `~/Library/Application Support/wordsbot/backups`. This is application
+data rather than configuration, so it stays outside `~/.config/wordsbot`.
 Override with `WORDSBOT_BACKUP_DIR` in the protected env file. Run
 `scripts/backup_postgres.sh` manually after important imports.
 
