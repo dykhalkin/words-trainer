@@ -24,7 +24,7 @@ from .languages import (
     validate_word,
 )
 from .models import TENSES, Noun, Verb, VerbPrep, Word
-from .words import RESERVED_DECK_NAMES, _ensure_general_deck, _find_deck, _insert_or_reuse_word
+from .words import RESERVED_DECK_NAMES, _find_deck, _insert_or_reuse_word
 
 NOUN_RE = re.compile(r"^(der|die|das)\s+(.+?)\s*(?:\((.+?)\))?$", re.IGNORECASE)
 PREP_RE = re.compile(r"^(.+?)\s+\+\s*(\w+)$")
@@ -118,7 +118,7 @@ async def import_csv(
 ) -> dict[str, Any]:
     language = normalize_language_code(language)
     if normalize_deck_name(deck_name) in RESERVED_DECK_NAMES:
-        raise ValueError("General and Archive are reserved deck names")
+        raise ValueError("Archive is a reserved deck name")
     parsed = load_file(path)
     summary: dict[str, Any] = {
         "file": path.name,
@@ -132,7 +132,6 @@ async def import_csv(
     }
     async with database.connection() as conn:
         async with conn.transaction():
-            await _ensure_general_deck(conn, user_id, language)
             deck = await _find_deck(conn, user_id, deck_name, language)
             if not deck:
                 result = await conn.execute(

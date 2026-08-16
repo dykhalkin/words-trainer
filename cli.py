@@ -170,11 +170,11 @@ async def command_pending(database: db.Database, args: argparse.Namespace) -> An
     user = await require_user(database, args.user)
     if args.command == "propose-words":
         cards = json.loads(args.cards_json)
+        deck = await resolve_deck(database, user["id"], args.deck, args.language)
         return await words.stage_cards(
             database,
             user_id=user["id"],
-            language=args.language,
-            deck_name=args.deck,
+            deck_id=deck["id"],
             cards=cards,
         )
     if args.command == "confirm-pending":
@@ -370,7 +370,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     propose = sub.add_parser("propose-words")
     propose.add_argument("--language", default="de")
-    propose.add_argument("--deck", required=True)
+    propose.add_argument("--deck", required=True, help="existing deck ID or name")
     propose.add_argument("--cards-json", required=True)
     confirm = sub.add_parser("confirm-pending")
     confirm.add_argument("pending_id")

@@ -52,6 +52,7 @@ class CliManagerTests(unittest.IsolatedAsyncioTestCase):
         created = await self.invoke("deck", "create", "CLI temporary")
         renamed = await self.invoke("deck", "rename", str(created["id"]), "CLI renamed")
         self.assertEqual(renamed["name"], "CLI renamed")
+        await self.invoke("deck", "create", "CLI proposals")
 
         async with self.database.connection() as conn:
             row = await conn.execute(

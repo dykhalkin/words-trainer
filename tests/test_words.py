@@ -63,8 +63,7 @@ class WordLifecycleTests(unittest.IsolatedAsyncioTestCase):
         staged = await words.stage_cards(
             self.database,
             user_id=self.owner["id"],
-            language="de",
-            deck_name="Arztbesuch",
+            deck_id=self.deck["id"],
             cards=[card],
         )
         committed = await words.commit_pending(
@@ -73,6 +72,9 @@ class WordLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(committed["inserted"], 1)
         stored = await words.get_word(self.database, self.owner["id"], "Praxis")
         self.assertEqual(stored.translation, "врачебный кабинет")
+
+    async def test_bootstrap_does_not_create_general(self) -> None:
+        self.assertEqual(await words.list_decks(self.database, self.spouse["id"]), [])
 
     async def test_language_normalization_preserves_meaningful_german_spelling(self) -> None:
         first, collision = await words.add_word(
@@ -112,7 +114,7 @@ class WordLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.database, self.owner["id"], "not-a-language", "Invalid"
             )
 
-    async def test_delete_deck_moves_words_and_protects_general(self) -> None:
+    async def test_delete_deck_requires_an_empty_deck(self) -> None:
         inserted, _ = await words.add_word(
             self.database,
             user_id=self.owner["id"],
@@ -120,13 +122,45 @@ class WordLifecycleTests(unittest.IsolatedAsyncioTestCase):
             deck_id=self.deck["id"],
             word=simple_word("bleiben", "оставаться"),
         )
-        result = await words.delete_deck(self.database, self.owner["id"], self.deck["id"])
-        self.assertEqual(result["moved_words"], 1)
+        with self.assertRaisesRegex(ValueError, "not empty"):
+            await words.delete_deck(self.database, self.owner["id"], self.deck["id"])
         stored = await words.get_word(self.database, self.owner["id"], inserted["id"])
-        self.assertEqual(stored.deck_id, result["general_deck_id"])
-        with self.assertRaisesRegex(ValueError, "general deck"):
-            await words.delete_deck(
-                self.database, self.owner["id"], result["general_deck_id"]
+        self.assertEqual(stored.deck_id, self.deck["id"])
+        empty = await words.create_deck(self.database, self.owner["id"], "de", "Empty")
+        result = await words.delete_deck(self.database, self.owner["id"], empty["id"])
+        self.assertEqual(result, {"deleted_deck_id": empty["id"]})
+
+    async def test_staging_requires_an_existing_owned_non_archive_deck(self) -> None:
+        card = {
+            "lemma": "heute",
+            "kind": "other",
+            "translation": "сегодня",
+            "example": "Heute lerne ich Deutsch.",
+            "pronunciation": "хойте",
+        }
+        with self.assertRaisesRegex(ValueError, "existing learner-owned"):
+            await words.stage_cards(
+                self.database, user_id=self.owner["id"], deck_id=999999, cards=[card]
+            )
+        spouse_deck = await words.create_deck(
+            self.database, self.spouse["id"], "de", "Private staging"
+        )
+        with self.assertRaisesRegex(ValueError, "existing learner-owned"):
+            await words.stage_cards(
+                self.database,
+                user_id=self.owner["id"],
+                deck_id=spouse_deck["id"],
+                cards=[card],
+            )
+        archive = await words.ensure_archive_deck(
+            self.database, self.owner["id"], "de"
+        )
+        with self.assertRaisesRegex(ValueError, "existing learner-owned"):
+            await words.stage_cards(
+                self.database,
+                user_id=self.owner["id"],
+                deck_id=archive["id"],
+                cards=[card],
             )
 
     async def test_generator_candidates_are_user_and_language_scoped(self) -> None:

@@ -23,12 +23,8 @@ from .languages import (
 )
 from .models import Noun, Verb, VerbPrep, Word
 
-GENERAL_DECK_NAME = "General"
 ARCHIVE_DECK_NAME = "Archive"
-RESERVED_DECK_NAMES = {
-    normalize_deck_name(GENERAL_DECK_NAME),
-    normalize_deck_name(ARCHIVE_DECK_NAME),
-}
+RESERVED_DECK_NAMES = {normalize_deck_name(ARCHIVE_DECK_NAME)}
 
 
 def _card_object(value: Any) -> dict[str, Any]:
@@ -98,27 +94,6 @@ def validate_card(language: str, fields: dict[str, Any] | WordCard) -> tuple[Wor
     return card, warnings
 
 
-async def _ensure_general_deck(
-    conn: AsyncConnection[dict[str, Any]], user_id: int, language: str
-) -> dict[str, Any]:
-    language = normalize_language_code(language)
-    result = await conn.execute(
-        """INSERT INTO decks(user_id, language, name, normalized_name, is_general)
-           VALUES (%s, %s, %s, %s, true)
-           ON CONFLICT (user_id, language) WHERE is_general
-           DO UPDATE SET user_id = EXCLUDED.user_id
-           RETURNING *""",
-        (user_id, language, GENERAL_DECK_NAME, normalize_deck_name(GENERAL_DECK_NAME)),
-    )
-    return await result.fetchone()
-
-
-async def ensure_general_deck(database: db.Database, user_id: int, language: str) -> dict[str, Any]:
-    async with database.connection() as conn:
-        async with conn.transaction():
-            return await _ensure_general_deck(conn, user_id, language)
-
-
 async def _ensure_archive_deck(
     conn: AsyncConnection[dict[str, Any]], user_id: int, language: str
 ) -> dict[str, Any]:
@@ -163,7 +138,6 @@ async def bootstrap_user(
                 (name, chat_id, timezone, llm_monthly_cap_usd),
             )
             user = await result.fetchone()
-            await _ensure_general_deck(conn, user["id"], language)
             await conn.execute(
                 """INSERT INTO reminder_policies(
                        user_id, mode, days_mask, window_start, window_end,
@@ -195,10 +169,9 @@ async def create_deck(
     language = normalize_language_code(language)
     name = normalize_spaces(name)
     if normalize_deck_name(name) in RESERVED_DECK_NAMES:
-        raise ValueError("General and Archive are reserved deck names")
+        raise ValueError("Archive is a reserved deck name")
     async with database.connection() as conn:
         async with conn.transaction():
-            await _ensure_general_deck(conn, user_id, language)
             result = await conn.execute(
                 """INSERT INTO decks(user_id, language, name, normalized_name)
                    VALUES (%s, %s, %s, %s) RETURNING *""",
@@ -249,7 +222,7 @@ async def list_decks(database: db.Database, user_id: int) -> list[dict[str, Any]
                       )::int AS needs_fix_count
                FROM decks d LEFT JOIN words w ON w.deck_id = d.id
                WHERE d.user_id = %s GROUP BY d.id
-               ORDER BY d.language, d.is_general DESC, d.is_archive, d.name""",
+               ORDER BY d.language, d.is_archive, d.name""",
             (user_id,),
         )
 
@@ -257,14 +230,14 @@ async def list_decks(database: db.Database, user_id: int) -> list[dict[str, Any]
 async def rename_deck(database: db.Database, user_id: int, deck_id: int, name: str) -> dict[str, Any]:
     normalized_name = normalize_deck_name(name)
     if normalized_name in RESERVED_DECK_NAMES:
-        raise ValueError("General and Archive are reserved deck names")
+        raise ValueError("Archive is a reserved deck name")
     async with database.connection() as conn:
         async with conn.transaction():
             deck = await _find_deck(conn, user_id, deck_id)
             if not deck:
                 raise LookupError("deck not found")
-            if deck["is_general"] or deck["is_archive"]:
-                raise ValueError("general deck or archive deck cannot be renamed")
+            if deck["is_archive"]:
+                raise ValueError("archive deck cannot be renamed")
             result = await conn.execute(
                 """UPDATE decks SET name = %s, normalized_name = %s, updated_at = now()
                    WHERE id = %s RETURNING *""",
@@ -283,15 +256,15 @@ async def delete_deck(database: db.Database, user_id: int, deck_id: int) -> dict
             deck = await result.fetchone()
             if not deck:
                 raise LookupError("deck not found")
-            if deck["is_general"] or deck["is_archive"]:
-                raise ValueError("general deck or archive deck cannot be deleted")
-            general = await _ensure_general_deck(conn, user_id, deck["language"])
-            moved = await conn.execute(
-                "UPDATE words SET deck_id = %s, modified_at = now() WHERE deck_id = %s",
-                (general["id"], deck_id),
+            if deck["is_archive"]:
+                raise ValueError("archive deck cannot be deleted")
+            word_count = await db.fetch_one(
+                conn, "SELECT count(*)::int AS value FROM words WHERE deck_id = %s", (deck_id,)
             )
+            if word_count["value"]:
+                raise ValueError("deck is not empty; move its words before deleting it")
             await conn.execute("DELETE FROM decks WHERE id = %s", (deck_id,))
-            return {"deleted_deck_id": deck_id, "moved_words": moved.rowcount, "general_deck_id": general["id"]}
+            return {"deleted_deck_id": deck_id}
 
 
 async def move_word(database: db.Database, user_id: int, word_id: int, deck_id: int) -> dict[str, Any]:
@@ -783,32 +756,37 @@ async def stage_cards(
     database: db.Database,
     *,
     user_id: int,
-    language: str,
-    deck_name: str,
+    deck_id: int,
     cards: list[dict[str, Any] | WordCard],
 ) -> dict[str, Any]:
-    language = normalize_language_code(language)
-    if normalize_deck_name(deck_name) in RESERVED_DECK_NAMES:
-        raise ValueError("General and Archive are reserved deck names")
-    validated = [validate_card(language, card)[0] for card in cards]
     pending_id = uuid.uuid4().hex
     async with database.connection() as conn:
+        deck = await db.fetch_one(
+            conn,
+            """SELECT * FROM decks
+               WHERE id = %s AND user_id = %s AND NOT is_archive""",
+            (deck_id, user_id),
+        )
+        if not deck:
+            raise ValueError("target deck must be an existing learner-owned active deck")
+        validated = [validate_card(deck["language"], card)[0] for card in cards]
         await conn.execute(
-            """INSERT INTO pending_cards(id, user_id, language, deck_name, cards)
+            """INSERT INTO pending_cards(id, user_id, language, deck_id, cards)
                VALUES (%s, %s, %s, %s, %s)""",
             (
                 pending_id,
                 user_id,
-                language,
-                normalize_spaces(deck_name),
+                deck["language"],
+                deck["id"],
                 Jsonb([card.model_dump(exclude_none=True) for card in validated]),
             ),
         )
     return {
         "pending_id": pending_id,
         "cards": len(validated),
-        "deck_name": deck_name,
-        "language": language,
+        "deck_id": deck["id"],
+        "deck_name": deck["name"],
+        "language": deck["language"],
     }
 
 
@@ -818,8 +796,9 @@ async def get_pending(
     async with database.connection() as conn:
         return await db.fetch_one(
             conn,
-            """SELECT * FROM pending_cards
-               WHERE id = %s AND user_id = %s AND status = 'pending'""",
+            """SELECT p.*, d.name AS deck_name FROM pending_cards p
+               JOIN decks d ON d.id = p.deck_id AND d.user_id = p.user_id
+               WHERE p.id = %s AND p.user_id = %s AND p.status = 'pending'""",
             (pending_id, user_id),
         )
 
@@ -830,28 +809,17 @@ async def commit_pending(
     async with database.connection() as conn:
         async with conn.transaction():
             result = await conn.execute(
-                """SELECT * FROM pending_cards
-                   WHERE id = %s AND user_id = %s AND status = 'pending' FOR UPDATE""",
+                """SELECT p.*, d.name AS deck_name, d.is_archive FROM pending_cards p
+                   JOIN decks d ON d.id = p.deck_id AND d.user_id = p.user_id
+                                AND d.language = p.language
+                   WHERE p.id = %s AND p.user_id = %s AND p.status = 'pending'
+                   FOR UPDATE OF p, d""",
                 (pending_id, user_id),
             )
             pending = await result.fetchone()
             if not pending:
                 raise LookupError("pending card proposal not found")
-            deck = await _find_deck(conn, user_id, pending["deck_name"], pending["language"])
-            if not deck:
-                await _ensure_general_deck(conn, user_id, pending["language"])
-                created = await conn.execute(
-                    """INSERT INTO decks(user_id, language, name, normalized_name)
-                       VALUES (%s, %s, %s, %s) RETURNING *""",
-                    (
-                        user_id,
-                        pending["language"],
-                        pending["deck_name"],
-                        normalize_deck_name(pending["deck_name"]),
-                    ),
-                )
-                deck = await created.fetchone()
-            if deck["is_archive"]:
+            if pending["is_archive"]:
                 raise ValueError("cannot commit cards into the archive deck")
             cards_raw = pending["cards"]
             if isinstance(cards_raw, str):
@@ -864,7 +832,7 @@ async def commit_pending(
                     conn,
                     user_id=user_id,
                     language=pending["language"],
-                    deck_id=deck["id"],
+                    deck_id=pending["deck_id"],
                     word=card.to_word(),
                     move_existing=move_existing,
                 )
@@ -878,7 +846,7 @@ async def commit_pending(
             )
             return {
                 "pending_id": pending_id,
-                "deck_id": deck["id"],
+                "deck_id": pending["deck_id"],
                 "inserted": inserted,
                 "collisions": collisions,
                 "word_ids": word_ids,

@@ -18,8 +18,10 @@ from .config import Settings
 
 INSTRUCTIONS = """You are a concise, friendly German tutor speaking Russian.
 Use tools for learner facts; never invent progress or override deterministic grading.
-When useful vocabulary emerges, call propose_words with complete validated cards.
-Proposals are previews only and require learner confirmation. Keep answers practical and short.
+When useful vocabulary emerges, call learner_decks, choose an existing non-archive deck, then
+call propose_words with that deck's numeric ID and complete validated cards. Never invent a deck
+name or create a deck. Proposals are previews only and require learner confirmation. Keep answers
+practical and short.
 """
 
 CARD_CORRECTION_INSTRUCTIONS = """You correct one vocabulary card from learner feedback.
@@ -162,16 +164,14 @@ async def current_task(ctx: RunContextWrapper[TutorContext], task_id: str) -> st
 @function_tool
 async def propose_words(
     ctx: RunContextWrapper[TutorContext],
-    language: str,
-    deck_name: str,
+    deck_id: int,
     cards: list[AgentWordCard],
 ) -> str:
-    """Stage complete word cards for learner confirmation; this never changes progress."""
+    """Stage complete cards in an existing learner deck; never creates a deck or progress."""
     staged = await words.stage_cards(
         ctx.context.database,
         user_id=ctx.context.learner["id"],
-        language=language,
-        deck_name=deck_name,
+        deck_id=deck_id,
         cards=[card.database_card().model_dump(exclude_none=True) for card in cards],
     )
     ctx.context.proposed.append(staged)

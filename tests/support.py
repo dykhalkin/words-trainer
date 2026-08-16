@@ -12,7 +12,7 @@ from vocab.db import DEFAULT_DATABASE_URL, Database
 
 
 @asynccontextmanager
-async def temporary_database() -> AsyncIterator[Database]:
+async def temporary_database(*, migrate: bool = True) -> AsyncIterator[Database]:
     base_dsn = os.environ.get("TEST_DATABASE_URL", DEFAULT_DATABASE_URL)
     name = f"words_trainer_test_{uuid.uuid4().hex}"
     admin_dsn = make_conninfo(base_dsn, dbname="postgres")
@@ -20,7 +20,7 @@ async def temporary_database() -> AsyncIterator[Database]:
     await admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
     database = Database(make_conninfo(base_dsn, dbname=name), open_timeout=10)
     try:
-        await database.open()
+        await database.open(migrate=migrate)
         yield database
     finally:
         await database.close()

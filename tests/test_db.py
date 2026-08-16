@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 from psycopg import errors
 from psycopg.types.json import Jsonb
 
 from tests.support import temporary_database
-from vocab.db import Database, DatabaseUnavailable
+from vocab.db import MIGRATIONS_DIR, Database, DatabaseUnavailable
 
 
 class MigrationTests(unittest.IsolatedAsyncioTestCase):
@@ -30,6 +31,7 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
                     {"version": "007_canonical_language_codes.sql"},
                     {"version": "008_complete_grading_reminder_schema.sql"},
                     {"version": "009_card_feedback_corrections.sql"},
+                    {"version": "010_existing_decks_only.sql"},
                 ],
             )
 
@@ -39,6 +41,112 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaisesRegex(DatabaseUnavailable, "PostgreSQL is unavailable"):
             await database.open()
+
+    async def test_existing_decks_migration_consolidates_without_data_loss(self) -> None:
+        async with temporary_database(migrate=False) as database:
+            async with database.connection() as conn:
+                async with conn.transaction():
+                    await conn.execute(
+                        """CREATE TABLE schema_migrations (
+                               version TEXT PRIMARY KEY,
+                               applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                           )"""
+                    )
+                    for path in sorted(Path(MIGRATIONS_DIR).glob("[0-9][0-9][0-9]_*.sql")):
+                        if path.name == "010_existing_decks_only.sql":
+                            break
+                        await conn.execute(path.read_text(encoding="utf-8"), prepare=False)
+                        await conn.execute(
+                            "INSERT INTO schema_migrations(version) VALUES (%s)",
+                            (path.name,),
+                        )
+                    user_result = await conn.execute(
+                        "INSERT INTO users(name, chat_id) VALUES ('owner', 1001) RETURNING id"
+                    )
+                    user_id = (await user_result.fetchone())["id"]
+                    target_result = await conn.execute(
+                        """INSERT INTO decks(user_id, language, name, normalized_name)
+                           VALUES (%s, 'de', 'B1.1', 'b1.1') RETURNING id""",
+                        (user_id,),
+                    )
+                    target_id = (await target_result.fetchone())["id"]
+                    await conn.execute(
+                        """INSERT INTO decks(user_id, language, name, normalized_name, is_general)
+                           VALUES (%s, 'de', 'General', 'general', true)""",
+                        (user_id,),
+                    )
+                    extra_names = [
+                        ("German", "german"),
+                        ("German vocabulary", "german vocabulary"),
+                        ("Общий", "общий"),
+                        ("Основной", "основной"),
+                        ("Общий немецкий", "общий немецкий"),
+                    ]
+                    word_ids = []
+                    for index, (name, normalized) in enumerate(extra_names):
+                        deck_result = await conn.execute(
+                            """INSERT INTO decks(user_id, language, name, normalized_name)
+                               VALUES (%s, 'de', %s, %s) RETURNING id""",
+                            (user_id, name, normalized),
+                        )
+                        deck_id = (await deck_result.fetchone())["id"]
+                        card = {
+                            "lemma": f"word-{index}",
+                            "kind": "other",
+                            "translation": f"translation-{index}",
+                            "example": f"Example {index}.",
+                            "pronunciation": f"word-{index}",
+                        }
+                        word_result = await conn.execute(
+                            """INSERT INTO words(
+                                   user_id, language, deck_id, lemma, lemma_key, kind, card
+                               ) VALUES (%s, 'de', %s, %s, %s, 'other', %s) RETURNING id""",
+                            (user_id, deck_id, f"word-{index}", f"word-{index}", Jsonb(card)),
+                        )
+                        word_id = (await word_result.fetchone())["id"]
+                        word_ids.append(word_id)
+                        await conn.execute(
+                            "INSERT INTO progress(word_id, reps) VALUES (%s, %s)",
+                            (word_id, index + 1),
+                        )
+                        await conn.execute(
+                            """INSERT INTO pending_cards(
+                                   id, user_id, language, deck_name, cards, status, resolved_at
+                               ) VALUES (%s, %s, 'de', %s, '[]', 'committed', now())""",
+                            (f"pending-{index}", user_id, name),
+                        )
+
+            await database.migrate()
+            await database.migrate()
+            async with database.connection() as conn:
+                decks = await conn.execute(
+                    "SELECT id, name FROM decks WHERE user_id = %s ORDER BY id", (user_id,)
+                )
+                saved_words = await conn.execute(
+                    """SELECT w.id, w.deck_id, p.reps FROM words w
+                       JOIN progress p ON p.word_id = w.id
+                       WHERE w.user_id = %s ORDER BY w.id""",
+                    (user_id,),
+                )
+                pending = await conn.execute(
+                    "SELECT DISTINCT deck_id FROM pending_cards WHERE user_id = %s", (user_id,)
+                )
+                columns = await conn.execute(
+                    """SELECT table_name, column_name FROM information_schema.columns
+                       WHERE table_schema = 'public'
+                         AND ((table_name = 'decks' AND column_name = 'is_general')
+                           OR (table_name = 'pending_cards' AND column_name = 'deck_name'))"""
+                )
+                deck_rows = await decks.fetchall()
+                word_rows = await saved_words.fetchall()
+                pending_rows = await pending.fetchall()
+                obsolete_columns = await columns.fetchall()
+            self.assertEqual(deck_rows, [{"id": target_id, "name": "B1.1"}])
+            self.assertEqual([row["id"] for row in word_rows], word_ids)
+            self.assertEqual([row["reps"] for row in word_rows], [1, 2, 3, 4, 5])
+            self.assertEqual({row["deck_id"] for row in word_rows}, {target_id})
+            self.assertEqual(pending_rows, [{"deck_id": target_id}])
+            self.assertEqual(obsolete_columns, [])
 
 
 class OwnershipConstraintTests(unittest.IsolatedAsyncioTestCase):
@@ -64,18 +172,18 @@ class OwnershipConstraintTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await self.context.__aexit__(None, None, None)
 
-    async def test_general_deck_is_unique_per_user_and_language(self) -> None:
+    async def test_general_has_no_system_role(self) -> None:
         async with self.database.connection() as conn:
             await conn.execute(
-                """INSERT INTO decks(user_id, language, name, normalized_name, is_general)
-                   VALUES (%s, 'de', 'General', 'general', true)""",
+                """INSERT INTO decks(user_id, language, name, normalized_name)
+                   VALUES (%s, 'de', 'General', 'general')""",
                 (self.owner_id,),
             )
             with self.assertRaises(errors.UniqueViolation):
                 async with conn.transaction():
                     await conn.execute(
-                        """INSERT INTO decks(user_id, language, name, normalized_name, is_general)
-                           VALUES (%s, 'de', 'Other general', 'other general', true)""",
+                        """INSERT INTO decks(user_id, language, name, normalized_name)
+                           VALUES (%s, 'de', 'GENERAL', 'general')""",
                         (self.owner_id,),
                     )
 

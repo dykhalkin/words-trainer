@@ -177,7 +177,7 @@ async def deck_stats(
         decks = await db.fetch_all(
             conn,
             """SELECT id FROM decks
-               WHERE user_id = %s AND NOT is_archive ORDER BY language, is_general DESC, name""",
+               WHERE user_id = %s AND NOT is_archive ORDER BY language, name""",
             (user_id,),
         )
     return [
