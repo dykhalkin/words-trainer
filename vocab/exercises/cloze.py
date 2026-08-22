@@ -103,6 +103,6 @@ async def generate(
 
 
 def check(expected: dict, answer: str) -> CheckResult:
-    result = check_text(answer.strip(), [expected["answer"]], expected["answer"], exact_quality=5)
-    result.note = (result.note + " " if result.note else "") + f"Предложение: {expected['sentence']}"
-    return result
+    return check_text(
+        answer.strip(), [expected["answer"]], expected["answer"], exact_quality=5
+    )

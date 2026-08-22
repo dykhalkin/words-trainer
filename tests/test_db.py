@@ -32,6 +32,8 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
                     {"version": "008_complete_grading_reminder_schema.sql"},
                     {"version": "009_card_feedback_corrections.sql"},
                     {"version": "010_existing_decks_only.sql"},
+                    {"version": "011_require_card_example.sql"},
+                    {"version": "012_quick_sessions.sql"},
                 ],
             )
 
@@ -227,6 +229,23 @@ class OwnershipConstraintTests(unittest.IsolatedAsyncioTestCase):
                         """INSERT INTO words(user_id, language, deck_id, lemma, lemma_key, kind, card)
                            VALUES (%s, 'de', %s, 'falsch', 'falsch', 'other', %s)""",
                         (self.spouse_id, self.owner_deck_id, Jsonb(card)),
+                    )
+
+    async def test_database_rejects_a_card_without_example(self) -> None:
+        card = {
+            "lemma": "leer",
+            "kind": "other",
+            "translation": "пустой",
+            "pronunciation": "леер",
+        }
+        async with self.database.connection() as conn:
+            with self.assertRaises(errors.CheckViolation):
+                async with conn.transaction():
+                    await conn.execute(
+                        """INSERT INTO words(
+                               user_id, language, deck_id, lemma, lemma_key, kind, card
+                           ) VALUES (%s, 'de', %s, 'leer', 'leer', 'other', %s)""",
+                        (self.owner_id, self.owner_deck_id, Jsonb(card)),
                     )
 
 

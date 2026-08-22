@@ -29,12 +29,12 @@ class LanguageSpec:
 GERMAN = LanguageSpec(
     code="de",
     prompt_name_ru="по-немецки",
-    exercise_types=("choice", "flashcard_ru_de", "cloze", "grammar"),
+    exercise_types=("choice", "choice_ru_de", "flashcard_ru_de", "cloze", "grammar"),
 )
 FALLBACK = LanguageSpec(
     code="*",
     prompt_name_ru="на изучаемом языке",
-    exercise_types=("choice", "flashcard_ru_de"),
+    exercise_types=("choice", "choice_ru_de", "flashcard_ru_de"),
 )
 REGISTRY = {"de": GERMAN}
 
@@ -81,9 +81,9 @@ def validate_word(word: Word, language: str, *, strict_agent: bool = False) -> l
         raise CardValidationError("lemma is required")
     if not normalize_spaces(word.translation):
         raise CardValidationError("translation is required")
+    if not normalize_spaces(word.example):
+        raise CardValidationError("example is required")
     if strict_agent:
-        if not normalize_spaces(word.example):
-            raise CardValidationError("example is required")
         if not normalize_spaces(word.pronunciation):
             raise CardValidationError("pronunciation is required")
 

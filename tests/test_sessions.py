@@ -74,9 +74,11 @@ class SessionIntegrityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(result["correct"])
         self.assertEqual(result["stage"], 1)
+        self.assertEqual(result["example"], "Das ist eins.")
         self.assertEqual(reused["error"], "exercise expired")
         self.assertIn("expected", answered_context)
         self.assertEqual(answered_context["answer"], "один")
+        self.assertNotIn("example", answered_context["verdict"])
 
     async def test_concurrent_answers_commit_one_review_and_transition(self) -> None:
         task = await scheduler.create_task(
@@ -284,6 +286,128 @@ class SessionIntegrityTests(unittest.IsolatedAsyncioTestCase):
             self.database, self.owner["id"], session_id=session["id"]
         )
         self.assertEqual(task["word_id"], self.word_rows[0]["id"])
+
+    async def test_quick_session_orders_by_progress_and_introduces_new_words(self) -> None:
+        future = datetime.now(timezone.utc) + timedelta(days=10)
+        async with self.database.connection() as conn:
+            await conn.execute(
+                """INSERT INTO progress(word_id, reps, interval_days, due_at)
+                   VALUES (%s, 5, 30, %s), (%s, 1, 1, %s), (%s, 3, 7, %s)""",
+                (
+                    self.word_rows[0]["id"], future,
+                    self.word_rows[1]["id"], future,
+                    self.word_rows[3]["id"], future,
+                ),
+            )
+        session = await scheduler.start_session(
+            self.database, self.owner["id"], kind="quick", deck_id=self.deck["id"]
+        )
+
+        first = await scheduler.create_task(
+            self.database, self.owner["id"], session_id=session["id"]
+        )
+        self.assertEqual(first["word"], "drei")
+        self.assertEqual(first["type"], "choice")
+        self.assertEqual(first["prompt"], "Что означает «drei»?")
+        await scheduler.submit_answer(
+            self.database, self.owner["id"], first["task_id"], "три"
+        )
+
+        second = await scheduler.create_task(
+            self.database, self.owner["id"], session_id=session["id"]
+        )
+        self.assertEqual(second["word"], "zwei")
+        self.assertEqual(second["type"], "choice_ru_de")
+        self.assertEqual(second["prompt"], "Как по-немецки «два»?")
+        self.assertIn("zwei", second["options"])
+        await scheduler.submit_answer(
+            self.database, self.owner["id"], second["task_id"], "zwei"
+        )
+
+        third = await scheduler.create_task(
+            self.database, self.owner["id"], session_id=session["id"]
+        )
+        self.assertEqual(third["word"], "vier")
+        self.assertEqual(third["type"], "choice")
+        async with self.database.connection() as conn:
+            introduced = await db.fetch_one(
+                conn, "SELECT * FROM progress WHERE word_id = %s", (first["word_id"],)
+            )
+            untouched = await db.fetch_one(
+                conn, "SELECT * FROM progress WHERE word_id = %s", (second["word_id"],)
+            )
+            reviews = await db.fetch_all(
+                conn,
+                "SELECT task_id FROM reviews WHERE task_id = ANY(%s)",
+                ([first["task_id"], second["task_id"]],),
+            )
+            saved_session = await db.fetch_one(
+                conn, "SELECT * FROM sessions WHERE id = %s", (session["id"],)
+            )
+        self.assertEqual(introduced["reps"], 1)
+        self.assertEqual(untouched["reps"], 1)
+        self.assertEqual(untouched["interval_days"], 1)
+        self.assertEqual(untouched["due_at"], future)
+        self.assertEqual([row["task_id"] for row in reviews], [first["task_id"]])
+        self.assertEqual(saved_session["answered_count"], 2)
+
+    async def test_quick_session_applies_due_review_and_expires_after_five_minutes(self) -> None:
+        deck = await words.create_deck(
+            self.database, self.owner["id"], "de", "Quick"
+        )
+        row, _ = await words.add_word(
+            self.database,
+            user_id=self.owner["id"],
+            language="de",
+            deck_id=deck["id"],
+            word=make_word("heute", "сегодня"),
+        )
+        async with self.database.connection() as conn:
+            await conn.execute(
+                """INSERT INTO progress(word_id, reps, interval_days, due_at)
+                   VALUES (%s, 1, 1, now() - interval '1 minute')""",
+                (row["id"],),
+            )
+        session = await scheduler.start_session(
+            self.database, self.owner["id"], kind="quick", deck_id=deck["id"]
+        )
+        due_task = await scheduler.create_task(
+            self.database, self.owner["id"], session_id=session["id"]
+        )
+        await scheduler.submit_answer(
+            self.database, self.owner["id"], due_task["task_id"], "сегодня"
+        )
+        async with self.database.connection() as conn:
+            progressed = await db.fetch_one(
+                conn, "SELECT * FROM progress WHERE word_id = %s", (row["id"],)
+            )
+            review = await db.fetch_one(
+                conn, "SELECT * FROM reviews WHERE task_id = %s", (due_task["task_id"],)
+            )
+        self.assertEqual(progressed["reps"], 2)
+        self.assertIsNotNone(review)
+
+        next_task = await scheduler.create_task(
+            self.database, self.owner["id"], session_id=session["id"]
+        )
+        async with self.database.connection() as conn:
+            await conn.execute(
+                "UPDATE sessions SET created_at = now() - interval '6 minutes' WHERE id = %s",
+                (session["id"],),
+            )
+        expired = await scheduler.submit_answer(
+            self.database, self.owner["id"], next_task["task_id"], "сегодня"
+        )
+        self.assertEqual(expired["error"], "session expired")
+        async with self.database.connection() as conn:
+            saved_session = await db.fetch_one(
+                conn, "SELECT * FROM sessions WHERE id = %s", (session["id"],)
+            )
+            expired_review = await db.fetch_one(
+                conn, "SELECT * FROM reviews WHERE task_id = %s", (next_task["task_id"],)
+            )
+        self.assertEqual(saved_session["status"], "expired")
+        self.assertIsNone(expired_review)
 
 
 if __name__ == "__main__":

@@ -234,6 +234,44 @@ class NewFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(new_deck["reviews_last_7d"]["count"], 0)
         self.assertEqual(new_deck["words_total"], 1)
 
+    async def test_stats_name_and_count_learning_stages(self) -> None:
+        await self.add("neu", "новый")
+        relearning = await self.add("noch einmal", "ещё раз")
+        learning = await self.add("kennen", "знать")
+        consolidating = await self.add("festigen", "закреплять")
+        mastered = await self.add("gemeistert", "освоенный", self.doctor["id"])
+        progress = (
+            (relearning["id"], 0, 0.0),
+            (learning["id"], 2, 6.0),
+            (consolidating["id"], 4, 15.0),
+            (mastered["id"], 5, 30.0),
+        )
+        async with self.database.connection() as conn:
+            for word_id, reps, interval_days in progress:
+                await conn.execute(
+                    """INSERT INTO progress(word_id, reps, interval_days)
+                       VALUES (%s, %s, %s)""",
+                    (word_id, reps, interval_days),
+                )
+
+        result = await statistics.stats(self.database, self.owner["id"])
+        stages = {stage["key"]: stage for stage in result["learning_stages"]}
+
+        self.assertEqual(
+            {key: stage["name"] for key, stage in stages.items()},
+            {
+                "new": "Новые",
+                "0": "Повторное изучение",
+                "1": "Знакомство",
+                "2": "Закрепление",
+                "3": "Освоено",
+            },
+        )
+        self.assertEqual(
+            {key: stage["count"] for key, stage in stages.items()},
+            {"new": 1, "0": 1, "1": 1, "2": 1, "3": 1},
+        )
+
     async def test_job_controls_are_persistent_and_claim_once(self) -> None:
         await jobs.ensure_controls(self.database)
         await jobs.set_enabled(self.database, "push", False)

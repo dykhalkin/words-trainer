@@ -703,8 +703,11 @@ async def claim_due_delivery(
                 return None
             active = await db.fetch_one(
                 conn,
-                """SELECT id FROM sessions WHERE user_id = %s AND kind = 'long'
-                   AND status = 'open' LIMIT 1""",
+                """SELECT id FROM sessions
+                   WHERE user_id = %s AND status = 'open'
+                     AND (kind = 'long' OR (kind = 'quick'
+                          AND created_at > now() - interval '5 minutes'))
+                   LIMIT 1""",
                 (delivery["user_id"],),
             )
             if active:

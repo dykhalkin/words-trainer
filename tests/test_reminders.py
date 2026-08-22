@@ -326,6 +326,23 @@ class ReminderPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(active["skip_reason"], "active_session")
 
         scheduled, delivery_id = await planned(2)
+        await scheduler.start_session(self.database, self.owner["id"], kind="quick")
+        self.assertIsNone(
+            await reminders.claim_due_delivery(
+                self.database, self.owner["id"], now=scheduled
+            )
+        )
+        async with self.database.connection() as conn:
+            active = await db.fetch_one(
+                conn, "SELECT * FROM deliveries WHERE id = %s", (delivery_id,)
+            )
+            await conn.execute(
+                "UPDATE sessions SET status = 'stopped', ended_at = now() WHERE user_id = %s",
+                (self.owner["id"],),
+            )
+        self.assertEqual(active["skip_reason"], "active_session")
+
+        scheduled, delivery_id = await planned(3)
         task = await scheduler.create_task(
             self.database,
             self.owner["id"],
@@ -351,7 +368,7 @@ class ReminderPersistenceTests(unittest.IsolatedAsyncioTestCase):
             recent = await db.fetch_one(conn, "SELECT * FROM deliveries WHERE id = %s", (delivery_id,))
         self.assertEqual(recent["skip_reason"], "recent_practice")
 
-        scheduled, delivery_id = await planned(3)
+        scheduled, delivery_id = await planned(4)
         self.assertIsNone(
             await reminders.claim_due_delivery(
                 self.database,

@@ -9,6 +9,30 @@ from zoneinfo import ZoneInfo
 from . import db, srs
 
 
+LEARNING_STAGES = (
+    {
+        "key": "new",
+        "name": "Новые",
+    },
+    {
+        "key": "0",
+        "name": "Повторное изучение",
+    },
+    {
+        "key": "1",
+        "name": "Знакомство",
+    },
+    {
+        "key": "2",
+        "name": "Закрепление",
+    },
+    {
+        "key": "3",
+        "name": "Освоено",
+    },
+)
+
+
 def _stage(row: dict[str, Any]) -> int:
     return srs.stage(int(row.get("reps") or 0), float(row.get("interval_days") or 0))
 
@@ -114,6 +138,17 @@ async def stats(
     by_stage = {str(index): 0 for index in range(4)}
     for row in progress_rows:
         by_stage[str(_stage(row))] += 1
+    stage_counts = {
+        "new": counts["total"] - counts["studied"],
+        **by_stage,
+    }
+    learning_stages = [
+        {
+            **definition,
+            "count": stage_counts[definition["key"]],
+        }
+        for definition in LEARNING_STAGES
+    ]
 
     daily = {
         day: {"date": day.isoformat(), "review_attempts": 0, "unique_words": set()}
@@ -143,6 +178,7 @@ async def stats(
         "words_studied": counts["studied"],
         "due_now": counts["due"],
         "by_stage": by_stage,
+        "learning_stages": learning_stages,
         "needs_fix": needs_fix["count"],
         "archived": archived["count"] if deck_id is None else 0,
         "today": {

@@ -124,6 +124,18 @@ class ImportExportTests(unittest.IsolatedAsyncioTestCase):
         word = await words.get_word(self.database, self.owner["id"], "gehen")
         self.assertEqual(word.deck_id, first["deck_id"])
 
+    async def test_import_rejects_a_missing_example(self) -> None:
+        path = self.root / "missing-example.csv"
+        write_csv(path, [["leer", "пустой", "", "леер"]])
+        with self.assertRaisesRegex(ValueError, "example is required"):
+            await storage.import_csv(
+                self.database,
+                path,
+                user_id=self.owner["id"],
+                deck_name="Invalid",
+                language="de",
+            )
+
     async def test_round_trip_all_card_kinds(self) -> None:
         path = self.root / "all.csv"
         forms = [f"form {i}" for i in range(18)]

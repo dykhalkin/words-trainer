@@ -213,6 +213,7 @@ class TwoPhaseGradingTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(verdict["correct"], correct)
             self.assertEqual(verdict["grading_source"], "tutor")
+            self.assertEqual(verdict["example"], "Das ist auf jeden Fall.")
             async with self.database.connection() as conn:
                 review = await db.fetch_one(
                     conn, "SELECT * FROM reviews WHERE task_id = %s", (task["task_id"],)
@@ -265,6 +266,18 @@ class TwoPhaseGradingTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(timed_out["status"], "failed")
         self.assertIn("timed out", timed_out["error"])
+
+    async def test_manual_incorrect_override_returns_the_card_example(self) -> None:
+        task = await self._task()
+        pending = await scheduler.begin_answer_submission(
+            self.database, self.owner["id"], task["task_id"], "alternative"
+        )
+        self.assertTrue(pending["pending"])
+        verdict = await scheduler.override_answer_incorrect(
+            self.database, self.owner["id"], task["task_id"]
+        )
+        self.assertFalse(verdict["correct"])
+        self.assertEqual(verdict["example"], "Das ist auf jeden Fall.")
 
     async def test_finalize_is_exactly_once_and_enforces_ownership(self) -> None:
         task = await self._task()

@@ -30,6 +30,11 @@ class PracticeDeckCallback(CallbackData, prefix="pd"):
     page: int = 0
 
 
+class QuickDeckCallback(CallbackData, prefix="qd"):
+    deck_id: int
+    page: int = 0
+
+
 class StatsDeckCallback(CallbackData, prefix="sd"):
     deck_id: int
     page: int = 0
@@ -87,10 +92,21 @@ def confirm_word_action_keyboard(task_id: str, action: str) -> InlineKeyboardMar
 
 
 def deck_picker_keyboard(
-    decks: list[dict], *, page: int = 0, stats: bool = False, page_size: int = 6
+    decks: list[dict],
+    *,
+    page: int = 0,
+    stats: bool = False,
+    quick: bool = False,
+    page_size: int = 6,
 ) -> InlineKeyboardMarkup:
+    if stats and quick:
+        raise ValueError("deck picker cannot select stats and quick mode together")
     decks = [deck for deck in decks if not deck.get("is_archive", False)]
-    callback_type = StatsDeckCallback if stats else PracticeDeckCallback
+    callback_type = (
+        StatsDeckCallback
+        if stats
+        else QuickDeckCallback if quick else PracticeDeckCallback
+    )
     start = page * page_size
     visible = decks[start : start + page_size]
     rows: list[list[InlineKeyboardButton]] = []
@@ -155,7 +171,7 @@ def start_keyboard(delivery_id: int = 0) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Начать короткую тренировку",
+                    text="Повторить 5 слов",
                     callback_data=StartSessionCallback(delivery_id=delivery_id).pack(),
                 )
             ]

@@ -26,6 +26,7 @@ DEFAULT_NEW_SCAN = 5
 STARTED_SCAN_LIMIT = 100
 TASK_TTL = timedelta(hours=24)
 SESSION_IDLE_TTL = timedelta(minutes=30)
+QUICK_SESSION_TTL = timedelta(minutes=5)
 
 
 def _stage(row: dict[str, Any]) -> int:
@@ -109,6 +110,86 @@ async def _pick_row(
     return rng.choice(rows[:DEFAULT_NEW_SCAN]) if queue == "new" else rows[0]
 
 
+async def _pick_quick_row(
+    conn: AsyncConnection[dict[str, Any]],
+    *,
+    user_id: int,
+    session_id: str,
+    deck_id: int | None,
+) -> dict[str, Any] | None:
+    """Pick quick-practice cards in stable, low-progress-first cycles."""
+    deck_clause = " AND w.deck_id = %s" if deck_id is not None else ""
+    params: list[Any] = [session_id, user_id]
+    if deck_id is not None:
+        params.append(deck_id)
+    return await db.fetch_one(
+        conn,
+        """SELECT w.*, p.reps, p.lapses, p.ease, p.interval_days, p.due_at,
+                  COALESCE(seen.seen_count, 0) AS quick_seen_count
+           FROM words w
+           JOIN decks d ON d.id = w.deck_id
+           LEFT JOIN progress p ON p.word_id = w.id
+           LEFT JOIN (
+               SELECT word_id, count(*)::int AS seen_count
+               FROM tasks WHERE session_id = %s GROUP BY word_id
+           ) seen ON seen.word_id = w.id
+           WHERE w.user_id = %s AND w.card_status = 'active' AND NOT d.is_archive"""
+        + deck_clause
+        + """ ORDER BY
+                  COALESCE(seen.seen_count, 0),
+                  CASE
+                      WHEN p.word_id IS NULL THEN -1
+                      WHEN p.reps = 0 THEN 0
+                      WHEN p.reps <= 2 THEN 1
+                      WHEN p.reps <= 4 AND p.interval_days < 21 THEN 2
+                      ELSE 3
+                  END,
+                  COALESCE(p.reps, 0),
+                  COALESCE(p.interval_days, 0),
+                  w.id
+              LIMIT 1""",
+        tuple(params),
+    )
+
+
+async def _quick_task_type(
+    conn: AsyncConnection[dict[str, Any]], session_id: str
+) -> str:
+    row = await db.fetch_one(
+        conn,
+        "SELECT count(*)::int AS count FROM tasks WHERE session_id = %s",
+        (session_id,),
+    )
+    return "choice" if row["count"] % 2 == 0 else "choice_ru_de"
+
+
+def quick_session_expired(
+    session: dict[str, Any], *, now: datetime | None = None
+) -> bool:
+    if session.get("kind") != "quick":
+        return False
+    now = now or datetime.now(timezone.utc)
+    return session["created_at"] + QUICK_SESSION_TTL <= now
+
+
+async def _expire_quick_session(
+    conn: AsyncConnection[dict[str, Any]], user_id: int, session_id: str
+) -> dict[str, Any] | None:
+    result = await conn.execute(
+        """UPDATE sessions SET status = 'expired', ended_at = now()
+           WHERE id = %s AND user_id = %s AND kind = 'quick' AND status = 'open'
+           RETURNING *""",
+        (session_id, user_id),
+    )
+    session = await result.fetchone()
+    await conn.execute(
+        """UPDATE tasks SET status = 'voided', voided_at = now()
+           WHERE user_id = %s AND session_id = %s AND status = 'open'""",
+        (user_id, session_id),
+    )
+    return session
+
+
 async def _row_by_query(
     conn: AsyncConnection[dict[str, Any]],
     *,
@@ -166,6 +247,7 @@ async def create_task(
             user_lock = await conn.execute("SELECT id FROM users WHERE id = %s FOR UPDATE", (user_id,))
             if not await user_lock.fetchone():
                 raise LookupError("user not found")
+            session: dict[str, Any] | None = None
             if session_id is not None:
                 session_result = await conn.execute(
                     """SELECT * FROM sessions
@@ -175,8 +257,13 @@ async def create_task(
                 session = await session_result.fetchone()
                 if not session:
                     return None
+                if quick_session_expired(session):
+                    await _expire_quick_session(conn, user_id, session_id)
+                    return None
                 if session["deck_id"] is not None:
                     deck_id = session["deck_id"]
+                if session["kind"] == "quick":
+                    task_type = await _quick_task_type(conn, session["id"])
                 if (
                     session["kind"] == "micro"
                     and word_id is None
@@ -190,6 +277,13 @@ async def create_task(
                     word_id=word_id,
                     word_query=word_query,
                     language=language,
+                )
+            elif session and session["kind"] == "quick":
+                row = await _pick_quick_row(
+                    conn,
+                    user_id=user_id,
+                    session_id=session["id"],
+                    deck_id=deck_id,
                 )
             else:
                 row = await _pick_row(
@@ -237,6 +331,11 @@ async def create_task(
                 (user_id,),
             )
             task_id = uuid.uuid4().hex[:16]
+            expires_at = datetime.now(timezone.utc) + TASK_TTL
+            if session and session["kind"] == "quick":
+                expires_at = min(
+                    expires_at, session["created_at"] + QUICK_SESSION_TTL
+                )
             await conn.execute(
                 """INSERT INTO tasks(
                        id, user_id, word_id, session_id, type, payload, expected, expires_at,
@@ -250,7 +349,7 @@ async def create_task(
                     selected_type,
                     Jsonb(payload),
                     Jsonb(expected),
-                    datetime.now(timezone.utc) + TASK_TTL,
+                    expires_at,
                     produced.response_mode,
                     produced.answer_language,
                     produced.grading_policy,
@@ -284,8 +383,11 @@ async def _locked_task(
     conn: AsyncConnection[dict[str, Any]], user_id: int, task_id: str
 ) -> dict[str, Any] | None:
     result = await conn.execute(
-        """SELECT t.*, w.lemma, w.language, w.card, w.deck_id
+        """SELECT t.*, w.lemma, w.language, w.card, w.deck_id,
+                  s.kind AS session_kind, s.created_at AS session_created_at,
+                  s.status AS session_status
            FROM tasks t JOIN words w ON w.id = t.word_id
+           LEFT JOIN sessions s ON s.id = t.session_id
            WHERE t.id = %s AND t.user_id = %s FOR UPDATE OF t""",
         (task_id, user_id),
     )
@@ -294,6 +396,20 @@ async def _locked_task(
 
 def _expired(task: dict[str, Any]) -> bool:
     return task["status"] != "open" or task["expires_at"] <= datetime.now(timezone.utc)
+
+
+async def _expire_task_quick_session(
+    conn: AsyncConnection[dict[str, Any]], task: dict[str, Any]
+) -> dict[str, Any] | None:
+    if (
+        task.get("session_kind") != "quick"
+        or task.get("session_created_at") is None
+        or task["session_created_at"] + QUICK_SESSION_TTL > datetime.now(timezone.utc)
+    ):
+        return None
+    return await _expire_quick_session(
+        conn, task["user_id"], task["session_id"]
+    )
 
 
 async def _commit_review(
@@ -309,32 +425,60 @@ async def _commit_review(
     evaluation_id: str | None = None,
     grader_feedback: str | None = None,
 ) -> dict[str, Any]:
+    expired_session = await _expire_task_quick_session(conn, task)
+    if expired_session:
+        return {
+            "error": "session expired",
+            "task_id": task["id"],
+            "session": expired_session,
+        }
+    now = datetime.now(timezone.utc)
     progress_result = await conn.execute(
         "SELECT * FROM progress WHERE word_id = %s FOR UPDATE", (task["word_id"],)
     )
     progress = await progress_result.fetchone()
-    schedule = srs.review(
-        reps=progress["reps"] if progress else 0,
-        lapses=progress["lapses"] if progress else 0,
-        ease=progress["ease"] if progress else 2.5,
-        interval_days=progress["interval_days"] if progress else 0.0,
-        quality=quality,
+    apply_srs = (
+        task.get("session_kind") != "quick"
+        or progress is None
+        or progress["due_at"] is None
+        or progress["due_at"] <= now
     )
-    await conn.execute(
-        """INSERT INTO progress(word_id, reps, lapses, ease, interval_days, due_at)
-           VALUES (%s, %s, %s, %s, %s, %s)
-           ON CONFLICT(word_id) DO UPDATE SET
-               reps = EXCLUDED.reps,
-               lapses = EXCLUDED.lapses,
-               ease = EXCLUDED.ease,
-               interval_days = EXCLUDED.interval_days,
-               due_at = EXCLUDED.due_at,
-               updated_at = now()""",
-        (
-            task["word_id"], schedule.reps, schedule.lapses, schedule.ease,
-            schedule.interval_days, schedule.due_at,
-        ),
-    )
+    if apply_srs:
+        schedule = srs.review(
+            reps=progress["reps"] if progress else 0,
+            lapses=progress["lapses"] if progress else 0,
+            ease=progress["ease"] if progress else 2.5,
+            interval_days=progress["interval_days"] if progress else 0.0,
+            quality=quality,
+            now=now,
+        )
+        await conn.execute(
+            """INSERT INTO progress(word_id, reps, lapses, ease, interval_days, due_at)
+               VALUES (%s, %s, %s, %s, %s, %s)
+               ON CONFLICT(word_id) DO UPDATE SET
+                   reps = EXCLUDED.reps,
+                   lapses = EXCLUDED.lapses,
+                   ease = EXCLUDED.ease,
+                   interval_days = EXCLUDED.interval_days,
+                   due_at = EXCLUDED.due_at,
+                   updated_at = now()""",
+            (
+                task["word_id"], schedule.reps, schedule.lapses, schedule.ease,
+                schedule.interval_days, schedule.due_at,
+            ),
+        )
+        next_review_at = schedule.due_at
+        interval_days = schedule.interval_days
+        stage = srs.stage(schedule.reps, schedule.interval_days)
+    else:
+        existing_due_at = progress["due_at"]
+        next_review_at = (
+            existing_due_at.isoformat(timespec="seconds")
+            if isinstance(existing_due_at, datetime)
+            else existing_due_at
+        )
+        interval_days = float(progress["interval_days"])
+        stage = srs.stage(progress["reps"], interval_days)
     verdict = {
         "correct": correct,
         "expected": expected,
@@ -342,26 +486,27 @@ async def _commit_review(
         "grader_feedback": grader_feedback,
         "grading_source": grading_source,
         "answer_evaluation_id": evaluation_id,
-        "next_review_at": schedule.due_at,
-        "interval_days": schedule.interval_days,
-        "stage": srs.stage(schedule.reps, schedule.interval_days),
+        "next_review_at": next_review_at,
+        "interval_days": interval_days,
+        "stage": stage,
     }
     await conn.execute(
         """UPDATE tasks SET status = 'answered', answered_at = now(), answer = %s,
                correct = %s, verdict = %s WHERE id = %s""",
         (answer, correct, Jsonb(verdict), task["id"]),
     )
-    await conn.execute(
-        """INSERT INTO reviews(
-               user_id, word_id, deck_id, task_id, task_type, answer, correct, quality,
-               grading_source, answer_evaluation_id, grader_feedback
-           ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-        (
-            task["user_id"], task["word_id"], task["deck_id"], task["id"],
-            task["type"], answer, correct, quality, grading_source, evaluation_id,
-            grader_feedback,
-        ),
-    )
+    if apply_srs:
+        await conn.execute(
+            """INSERT INTO reviews(
+                   user_id, word_id, deck_id, task_id, task_type, answer, correct, quality,
+                   grading_source, answer_evaluation_id, grader_feedback
+               ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (
+                task["user_id"], task["word_id"], task["deck_id"], task["id"],
+                task["type"], answer, correct, quality, grading_source, evaluation_id,
+                grader_feedback,
+            ),
+        )
     session_complete = False
     session_answered_count: int | None = None
     session_correct_count: int | None = None
@@ -397,8 +542,9 @@ async def _commit_review(
         "answer_evaluation_id": evaluation_id,
         "word": task["lemma"],
         "translation": card.get("translation", ""),
-        "next_review_at": schedule.due_at,
-        "interval_days": schedule.interval_days,
+        "example": card.get("example", ""),
+        "next_review_at": next_review_at,
+        "interval_days": interval_days,
         "stage": verdict["stage"],
         "session_complete": session_complete,
         "session_answered_count": session_answered_count,
@@ -432,6 +578,13 @@ async def begin_answer_submission(
             task = await _locked_task(conn, user_id, task_id)
             if not task:
                 return {"error": "exercise expired", "task_id": task_id}
+            expired_session = await _expire_task_quick_session(conn, task)
+            if expired_session:
+                return {
+                    "error": "session expired",
+                    "task_id": task_id,
+                    "session": expired_session,
+                }
             if _expired(task):
                 if task["status"] == "open":
                     await conn.execute(
@@ -537,6 +690,13 @@ async def finalize_tutor_evaluation(
             evaluation = await result.fetchone()
             if not evaluation or evaluation["status"] != "pending":
                 return {"stale": True, "evaluation_id": evaluation_id}
+            if task and await _expire_task_quick_session(conn, task):
+                await conn.execute(
+                    """UPDATE answer_evaluations SET status = 'discarded', finished_at = now()
+                       WHERE id = %s""",
+                    (evaluation_id,),
+                )
+                return {"stale": True, "evaluation_id": evaluation_id}
             if not task or _expired(task):
                 await conn.execute(
                     """UPDATE answer_evaluations SET status = 'discarded', finished_at = now()
@@ -615,6 +775,8 @@ async def override_answer_incorrect(
     async with database.connection() as conn:
         async with conn.transaction():
             task = await _locked_task(conn, user_id, task_id)
+            if task and await _expire_task_quick_session(conn, task):
+                return {"error": "session expired", "task_id": task_id}
             if not task or _expired(task):
                 return {"error": "exercise expired", "task_id": task_id}
             evaluation = await db.fetch_one(
@@ -710,8 +872,8 @@ async def start_session(
     deck_id: int | None = None,
     target_count: int | None = None,
 ) -> dict[str, Any]:
-    if kind not in {"micro", "long"}:
-        raise ValueError("session kind must be micro or long")
+    if kind not in {"micro", "long", "quick"}:
+        raise ValueError("session kind must be micro, long, or quick")
     if kind == "micro" and target_count is None:
         target_count = 5
     session_id = uuid.uuid4().hex[:16]
@@ -770,12 +932,15 @@ async def stop_session(database: db.Database, user_id: int) -> dict[str, Any] | 
 
 async def close_idle_sessions(database: db.Database) -> int:
     cutoff = datetime.now(timezone.utc) - SESSION_IDLE_TTL
+    quick_cutoff = datetime.now(timezone.utc) - QUICK_SESSION_TTL
     async with database.connection() as conn:
         async with conn.transaction():
             result = await conn.execute(
                 """UPDATE sessions SET status = 'expired', ended_at = now()
-                   WHERE status = 'open' AND last_activity_at < %s RETURNING user_id""",
-                (cutoff,),
+                   WHERE status = 'open'
+                     AND (last_activity_at < %s OR (kind = 'quick' AND created_at <= %s))
+                   RETURNING user_id""",
+                (cutoff, quick_cutoff),
             )
             rows = await result.fetchall()
             if rows:

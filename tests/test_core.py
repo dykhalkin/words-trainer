@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timezone
 
 from vocab import srs, storage
-from vocab.exercises import flashcard
+from vocab.exercises import choice_ru_de, cloze, flashcard
 from vocab.models import Noun
 
 
@@ -54,8 +54,24 @@ class SrsTests(unittest.TestCase):
         self.assertEqual(lapse.interval_days, 0.0)
         self.assertEqual(srs.stage(lapse.reps, lapse.interval_days), 0)
 
+    def test_stage_boundaries_match_the_learning_guide(self) -> None:
+        self.assertEqual(srs.stage(0, 0.0), 0)
+        self.assertEqual(srs.stage(1, 1.0), 1)
+        self.assertEqual(srs.stage(2, 3.0), 1)
+        self.assertEqual(srs.stage(3, 8.0), 2)
+        self.assertEqual(srs.stage(4, 20.9), 2)
+        self.assertEqual(srs.stage(4, 21.0), 3)
+        self.assertEqual(srs.stage(5, 10.0), 3)
+
 
 class ExerciseTests(unittest.TestCase):
+    def test_reverse_choice_checks_the_studied_language_answer(self) -> None:
+        result = choice_ru_de.check(
+            {"correct_index": 1, "correct_text": "die Salbe"}, "die Salbe"
+        )
+        self.assertTrue(result.correct)
+        self.assertEqual(result.expected, "die Salbe")
+
     def test_rude_mismatch_requires_semantic_grading(self) -> None:
         result = flashcard.RuDe.check(
             {"lemma": "die Salbe", "kind": "noun", "headword": "Salbe"},
@@ -63,6 +79,13 @@ class ExerciseTests(unittest.TestCase):
         )
         self.assertFalse(result.correct)
         self.assertEqual(result.quality, 1)
+
+    def test_cloze_does_not_duplicate_the_example_in_note(self) -> None:
+        result = cloze.check(
+            {"answer": "gehe", "sentence": "Ich gehe nach Hause."}, "gehe"
+        )
+        self.assertTrue(result.correct)
+        self.assertEqual(result.note, "")
 
 
 if __name__ == "__main__":

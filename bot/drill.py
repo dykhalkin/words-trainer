@@ -18,6 +18,7 @@ from .keyboards import (
     AnswerCallback,
     IssuesCallback,
     PracticeDeckCallback,
+    QuickDeckCallback,
     StartSessionCallback,
     StatsDeckCallback,
     WordActionCallback,
@@ -29,7 +30,13 @@ from .keyboards import (
     issues_keyboard,
     post_answer_keyboard,
 )
-from .presentation import session_summary, stats_text, task_text, verdict_text
+from .presentation import (
+    learning_guide_text,
+    session_summary,
+    stats_text,
+    task_text,
+    verdict_text,
+)
 
 router = Router(name="drill")
 logger = logging.getLogger(__name__)
@@ -42,12 +49,15 @@ def _payload(value: Any) -> dict[str, Any]:
 async def send_task(message: Message, database: db.Database, learner: dict[str, Any]) -> None:
     session = await scheduler.get_open_session(database, learner["id"])
     if not session:
-        await message.answer("Сначала начните тренировку: /practice")
+        await message.answer("Сначала начните тренировку: /practice или /quick")
         return
     task = await scheduler.create_task(database, learner["id"], session_id=session["id"])
     if task is None:
-        stopped = await scheduler.stop_session(database, learner["id"])
-        await message.answer(session_summary(stopped) + "\nСейчас больше нечего повторять.")
+        if scheduler.quick_session_expired(session):
+            await message.answer(session_summary(session) + "\nПять минут истекли.")
+        else:
+            stopped = await scheduler.stop_session(database, learner["id"])
+            await message.answer(session_summary(stopped) + "\nСейчас больше нечего повторять.")
         return
     options = list(task.get("options") or [])
     markup = answer_keyboard(task["task_id"], options)
@@ -68,6 +78,11 @@ async def finish_answer(
         database, learner["id"], task_id, answer
     )
     if verdict.get("error"):
+        if verdict["error"] == "session expired":
+            await message.answer(
+                session_summary(verdict.get("session")) + "\nПять минут истекли."
+            )
+            return
         if not edit:
             await message.answer("Это упражнение уже неактивно.")
         return
@@ -208,8 +223,10 @@ async def start(message: Message) -> None:
     await message.answer(
         "Я помогу регулярно повторять слова.\n\n"
         "/practice — длинная тренировка\n"
+        "/quick — быстрая тренировка на 5 минут\n"
         "/decks — колоды\n"
         "/stats — статистика\n"
+        "/howto — как работает обучение\n"
         "/reminders — умные напоминания\n"
         "/issues — карточки, требующие исправления\n"
         "/stop — остановить тренировку"
@@ -222,6 +239,20 @@ async def practice(message: Message, database: db.Database, learner: dict[str, A
     decks = [row for row in await words.list_decks(database, learner["id"]) if not row["is_archive"]]
     await message.answer(
         "Выберите колоду для тренировки:", reply_markup=deck_picker_keyboard(decks)
+    )
+
+
+@router.message(Command("quick"))
+async def quick(message: Message, database: db.Database, learner: dict[str, Any]) -> None:
+    await reminders.clear_pending_action(database, learner["id"])
+    decks = [
+        row
+        for row in await words.list_decks(database, learner["id"])
+        if not row["is_archive"]
+    ]
+    await message.answer(
+        "Выберите колоду для быстрой тренировки:",
+        reply_markup=deck_picker_keyboard(decks, quick=True),
     )
 
 
@@ -245,6 +276,11 @@ async def stats(message: Message, database: db.Database, learner: dict[str, Any]
     await message.answer(
         stats_text(value), reply_markup=deck_picker_keyboard(decks, stats=True)
     )
+
+
+@router.message(Command("howto", "help"))
+async def howto(message: Message) -> None:
+    await message.answer(learning_guide_text())
 
 
 async def _issues_page(database: db.Database, learner: dict[str, Any], page: int) -> tuple[str, Any]:
@@ -295,6 +331,45 @@ async def choose_practice_deck(
         return
     await callback.answer()
     await callback.message.edit_text("Тренировка началась. /stop — закончить.", reply_markup=None)
+    await send_task(callback.message, database, learner)
+
+
+@router.callback_query(QuickDeckCallback.filter())
+async def choose_quick_deck(
+    callback: CallbackQuery,
+    callback_data: QuickDeckCallback,
+    database: db.Database,
+    learner: dict[str, Any],
+) -> None:
+    if not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+    decks = [
+        row
+        for row in await words.list_decks(database, learner["id"])
+        if not row["is_archive"]
+    ]
+    if callback_data.deck_id == -1:
+        await callback.answer()
+        await callback.message.edit_reply_markup(
+            reply_markup=deck_picker_keyboard(
+                decks, page=callback_data.page, quick=True
+            )
+        )
+        return
+    deck_id = callback_data.deck_id or None
+    try:
+        await scheduler.start_session(
+            database, learner["id"], kind="quick", deck_id=deck_id
+        )
+    except (LookupError, ValueError):
+        await callback.answer("Колода больше недоступна")
+        return
+    await callback.answer()
+    await callback.message.edit_text(
+        "Быстрая тренировка началась и продлится 5 минут. /stop — закончить раньше.",
+        reply_markup=None,
+    )
     await send_task(callback.message, database, learner)
 
 

@@ -13,6 +13,7 @@ from bot.keyboards import (
     AnswerCallback,
     GradeCallback,
     PracticeDeckCallback,
+    QuickDeckCallback,
     ReminderCallback,
     StatsDeckCallback,
     WordActionCallback,
@@ -21,7 +22,13 @@ from bot.keyboards import (
     post_answer_keyboard,
 )
 from bot.middleware import LearnerMiddleware, update_chat
-from bot.presentation import session_summary, task_text, verdict_text
+from bot.presentation import (
+    learning_guide_text,
+    session_summary,
+    stats_text,
+    task_text,
+    verdict_text,
+)
 
 
 class BotPresentationTests(unittest.TestCase):
@@ -49,6 +56,7 @@ class BotPresentationTests(unittest.TestCase):
         )
         payloads = [
             PracticeDeckCallback(deck_id=123456789, page=99).pack(),
+            QuickDeckCallback(deck_id=123456789, page=99).pack(),
             StatsDeckCallback(deck_id=123456789, page=99).pack(),
             WordActionCallback(
                 task_id="1234567890abcdef", action="archive", confirm=1
@@ -83,6 +91,9 @@ class BotPresentationTests(unittest.TestCase):
         labels = [button.text for row in markup.inline_keyboard for button in row]
         self.assertIn("A2 (de) · 3", labels)
         self.assertNotIn("Archive", labels)
+        quick_markup = deck_picker_keyboard(decks, quick=True)
+        quick_payload = quick_markup.inline_keyboard[0][0].callback_data or ""
+        self.assertTrue(quick_payload.startswith("qd:"))
 
     def test_rendering_for_typed_task_and_verdict(self) -> None:
         self.assertIn(
@@ -94,9 +105,81 @@ class BotPresentationTests(unittest.TestCase):
             "✅ Верно\nОтвет: gehen",
         )
         self.assertEqual(
+            verdict_text(
+                {
+                    "correct": False,
+                    "expected": "gehen",
+                    "note": "Проверьте форму.",
+                    "example": "Ich gehe nach Hause.",
+                }
+            ),
+            "❌ Не совсем\nОтвет: gehen\nПроверьте форму.\n\n"
+            "Пример: Ich gehe nach Hause.",
+        )
+        self.assertEqual(
             session_summary({"answered_count": 5, "correct_count": 4}),
             "Тренировка завершена: 4/5 правильных.",
         )
+
+    def test_stats_names_stages_without_explanations_or_word_lists(self) -> None:
+        value = {
+            "deck": None,
+            "words_total": 2,
+            "words_new": 1,
+            "words_studied": 1,
+            "due_now": 1,
+            "today": {"review_attempts": 0, "unique_words": 0},
+            "reviews_last_7d": {"accuracy": None, "correct": 0, "count": 0},
+            "days": 7,
+            "needs_fix": 0,
+            "archived": 0,
+            "learning_stages": [
+                {
+                    "key": "new",
+                    "name": "Новые",
+                    "count": 1,
+                },
+                {
+                    "key": "1",
+                    "name": "Знакомство",
+                    "count": 1,
+                },
+            ],
+            "daily_activity": [],
+        }
+
+        rendered = stats_text(value)
+
+        self.assertNotIn("Этапы 0–3", rendered)
+        self.assertIn("Новые: 1", rendered)
+        self.assertIn("Знакомство: 1", rendered)
+        self.assertNotIn("neu", rendered)
+        self.assertNotIn("1–2 успешных повторения", rendered)
+        self.assertIn("Ответов: 0", rendered)
+        self.assertNotIn(" / ", rendered)
+
+    def test_learning_guide_explains_stages_and_timing(self) -> None:
+        rendered = learning_guide_text()
+
+        for stage in (
+            "Новые",
+            "Повторное изучение",
+            "Знакомство",
+            "Закрепление",
+            "Освоено",
+        ):
+            self.assertIn(stage, rendered)
+        self.assertIn("10 минут", rendered)
+        self.assertIn("1 день и 3 дня", rendered)
+        self.assertIn("около 8 дней", rendered)
+        self.assertIn("3 недель, затем 2 и 6 месяцев", rendered)
+        self.assertIn("примерно за 12 дней", rendered)
+        self.assertIn("Новые → Знакомство: 1 засчитанный ответ", rendered)
+        self.assertIn("нужны ещё 2", rendered)
+        self.assertIn("интервал должен достичь 21 дня", rendered)
+        self.assertIn("требуется 4 засчитанных ответа", rendered)
+        self.assertIn("либо 5 при замедленном", rendered)
+        self.assertIn("Любая новая ошибка запускает этот путь заново", rendered)
 
 
 class ConfigTests(unittest.TestCase):

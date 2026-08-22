@@ -8,12 +8,13 @@ The result explicitly declares response mode, answer language, and grading polic
 addition to the visible payload and server-side expected data.
 """
 
-from . import choice, cloze, flashcard, grammar
+from . import choice, choice_ru_de, cloze, flashcard, grammar
 from .base import CheckResult, GeneratedExercise
 from ..languages import ExerciseContext
 
 GENERATORS = {
     "choice": choice,
+    "choice_ru_de": choice_ru_de,
     "flashcard_ru_de": flashcard.RuDe,
     "cloze": cloze,
     "grammar": grammar,

@@ -86,8 +86,10 @@ async def run(settings: Settings) -> None:
         await bot.set_my_commands(
             [
                 BotCommand(command="practice", description="длинная тренировка"),
+                BotCommand(command="quick", description="быстрая тренировка на 5 минут"),
                 BotCommand(command="decks", description="мои колоды"),
                 BotCommand(command="stats", description="статистика"),
+                BotCommand(command="howto", description="как работает обучение"),
                 BotCommand(command="issues", description="карточки с ошибками"),
                 BotCommand(command="reminders", description="умные напоминания"),
                 BotCommand(command="stop", description="остановить тренировку"),
