@@ -11,6 +11,7 @@ from aiogram.types import Chat, Message, Update, User
 from bot.config import Settings, load_settings
 from bot.keyboards import (
     AnswerCallback,
+    ContextDeckCallback,
     GradeCallback,
     PracticeDeckCallback,
     QuickDeckCallback,
@@ -57,6 +58,7 @@ class BotPresentationTests(unittest.TestCase):
         payloads = [
             PracticeDeckCallback(deck_id=123456789, page=99).pack(),
             QuickDeckCallback(deck_id=123456789, page=99).pack(),
+            ContextDeckCallback(deck_id=123456789, page=99).pack(),
             StatsDeckCallback(deck_id=123456789, page=99).pack(),
             WordActionCallback(
                 task_id="1234567890abcdef", action="archive", confirm=1
@@ -94,6 +96,9 @@ class BotPresentationTests(unittest.TestCase):
         quick_markup = deck_picker_keyboard(decks, quick=True)
         quick_payload = quick_markup.inline_keyboard[0][0].callback_data or ""
         self.assertTrue(quick_payload.startswith("qd:"))
+        context_markup = deck_picker_keyboard(decks, context_mode=True)
+        context_payload = context_markup.inline_keyboard[0][0].callback_data or ""
+        self.assertTrue(context_payload.startswith("cd:"))
 
     def test_rendering_for_typed_task_and_verdict(self) -> None:
         self.assertIn(
@@ -115,6 +120,53 @@ class BotPresentationTests(unittest.TestCase):
             ),
             "❌ Не совсем\nОтвет: gehen\nПроверьте форму.\n\n"
             "Пример: Ich gehe nach Hause.",
+        )
+        self.assertEqual(
+            verdict_text(
+                {
+                    "correct": False,
+                    "word": "die Salbe",
+                    "expected": "die Salbe",
+                    "note": "Артикль обязателен.",
+                    "example": "Die Salbe hilft.",
+                }
+            ),
+            "❌ Не совсем\nСлово: die Salbe\nОтвет: die Salbe\n"
+            "Артикль обязателен.\n\nПример для «die Salbe»: Die Salbe hilft.",
+        )
+        self.assertEqual(
+            verdict_text(
+                {
+                    "correct": True,
+                    "kind": "phrase",
+                    "word": "auf jeden Fall",
+                    "expected": "auf jeden Fall",
+                    "example": "Ich komme auf jeden Fall.",
+                }
+            ),
+            "✅ Верно\nФраза: auf jeden Fall\nОтвет: auf jeden Fall\n\n"
+            "Пример фразы «auf jeden Fall»: Ich komme auf jeden Fall.",
+        )
+        tense_verdict = verdict_text(
+            {
+                "correct": True,
+                "kind": "verb",
+                "word": "aufbauen",
+                "expected": "aufbauen",
+                "tense_strip": {
+                    "person": "er/es/sie",
+                    "forms": [
+                        {"tense": "Präsens", "form": "baut auf"},
+                        {"tense": "Perfekt", "form": "hat aufgebaut"},
+                        {"tense": "Präteritum", "form": "baute auf"},
+                    ],
+                },
+            }
+        )
+        self.assertIn(
+            "Времена (er/es/sie): Präsens: baut auf · "
+            "Perfekt: hat aufgebaut · Präteritum: baute auf",
+            tense_verdict,
         )
         self.assertEqual(
             session_summary({"answered_count": 5, "correct_count": 4}),
@@ -180,6 +232,14 @@ class BotPresentationTests(unittest.TestCase):
         self.assertIn("требуется 4 засчитанных ответа", rendered)
         self.assertIn("либо 5 при замедленном", rendered)
         self.assertIn("Любая новая ошибка запускает этот путь заново", rendered)
+        self.assertIn(
+            "только на этапах «Закрепление» и «Освоено»", rendered
+        )
+        self.assertIn("Как изучаются фразы", rendered)
+        self.assertIn("применить в короткой новой реплике", rendered)
+        self.assertIn("Подходящий синоним считается почти правильным", rendered)
+        self.assertIn("Команда /context", rendered)
+        self.assertIn("не изменяет этап, интервал", rendered)
 
 
 class ConfigTests(unittest.TestCase):

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 PERSONS = ["ich", "du", "er/es/sie", "wir", "ihr", "Sie"]
 TENSES = ["praesens", "perfekt", "praeteritum"]
+PHRASE_TYPES = ["fixed", "collocation", "frame"]
 
 
 @dataclass
@@ -80,3 +81,10 @@ class VerbPrep(Word):
     @property
     def rection(self) -> str:
         return f"{self.preposition} + {self.case}"
+
+
+@dataclass
+class Phrase(Word):
+    """A multiword learning unit with language-independent exercise semantics."""
+
+    phrase_type: str = "fixed"  # fixed | collocation | frame

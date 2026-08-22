@@ -3,13 +3,13 @@
 Quality scale (subset of classic 0-5):
     5 — exact correct answer on a hard (productive) exercise
     4 — correct answer
-    3 — almost correct (typo / missing article): counts as passed, ease drops a bit
+    3 — almost correct (minor accepted defect): counts as passed, ease drops a bit
     1 — wrong
 
 Stage drives exercise difficulty (see scheduler):
     0 — new or lapsed       -> recognition (multiple choice)
     1 — learning            -> target-language recall
-    2 — consolidating       -> target-language recall, cloze
+    2 — consolidating       -> target-language recall, cloze, verb tense drills
     3 — mature              -> cloze, grammar, target-language recall
 """
 

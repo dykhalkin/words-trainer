@@ -34,6 +34,8 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
                     {"version": "010_existing_decks_only.sql"},
                     {"version": "011_require_card_example.sql"},
                     {"version": "012_quick_sessions.sql"},
+                    {"version": "013_phrase_cards.sql"},
+                    {"version": "014_context_sessions.sql"},
                 ],
             )
 

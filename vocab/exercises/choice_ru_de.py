@@ -10,7 +10,7 @@ from psycopg import AsyncConnection
 from .. import db
 from ..languages import ExerciseContext, language_spec
 from ..models import Word
-from .base import CheckResult, GeneratedExercise
+from .base import CheckResult, GeneratedExercise, display_lemma
 
 N_OPTIONS = 4
 
@@ -31,7 +31,7 @@ async def generate(
         limit=N_OPTIONS - 1,
     )
     if len(distractors) < N_OPTIONS - 1:
-        seen = {candidate.lemma for candidate in distractors}
+        seen = {display_lemma(candidate) for candidate in distractors}
         candidates = await db.sample_words(
             conn,
             user_id=context.user_id,
@@ -40,20 +40,22 @@ async def generate(
             limit=N_OPTIONS * 2,
         )
         for candidate in candidates:
-            if candidate.lemma not in seen:
+            candidate_lemma = display_lemma(candidate)
+            if candidate_lemma not in seen:
                 distractors.append(candidate)
-                seen.add(candidate.lemma)
+                seen.add(candidate_lemma)
             if len(distractors) == N_OPTIONS - 1:
                 break
-    options = [candidate.lemma for candidate in distractors] + [word.lemma]
+    visible_word = display_lemma(word)
+    options = [display_lemma(candidate) for candidate in distractors] + [visible_word]
     rng.shuffle(options)
-    correct_idx = options.index(word.lemma)
+    correct_idx = options.index(visible_word)
     prompt_name = language_spec(context.language).prompt_name_ru
     payload = {
         "prompt": f"Как {prompt_name} «{word.translation}»?",
         "options": options,
     }
-    expected = {"correct_index": correct_idx, "correct_text": word.lemma}
+    expected = {"correct_index": correct_idx, "correct_text": visible_word}
     return GeneratedExercise(payload, expected, "choice", None, "deterministic")
 
 

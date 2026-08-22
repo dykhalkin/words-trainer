@@ -6,7 +6,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-from .models import TENSES, Noun, Verb, VerbPrep, Word
+from .models import PHRASE_TYPES, TENSES, Noun, Phrase, Verb, VerbPrep, Word
 
 
 class CardValidationError(ValueError):
@@ -29,12 +29,26 @@ class LanguageSpec:
 GERMAN = LanguageSpec(
     code="de",
     prompt_name_ru="по-немецки",
-    exercise_types=("choice", "choice_ru_de", "flashcard_ru_de", "cloze", "grammar"),
+    exercise_types=(
+        "choice",
+        "choice_ru_de",
+        "flashcard_ru_de",
+        "cloze",
+        "grammar",
+        "phrase_cloze",
+        "phrase_context",
+    ),
 )
 FALLBACK = LanguageSpec(
     code="*",
     prompt_name_ru="на изучаемом языке",
-    exercise_types=("choice", "choice_ru_de", "flashcard_ru_de"),
+    exercise_types=(
+        "choice",
+        "choice_ru_de",
+        "flashcard_ru_de",
+        "phrase_cloze",
+        "phrase_context",
+    ),
 )
 REGISTRY = {"de": GERMAN}
 
@@ -104,8 +118,22 @@ def validate_word(word: Word, language: str, *, strict_agent: bool = False) -> l
     if language == "de" and isinstance(word, VerbPrep):
         if not all(normalize_spaces(v) for v in (word.verb, word.preposition, word.case)):
             raise CardValidationError("German verb-preposition card requires verb, preposition, and case")
+    if isinstance(word, Phrase):
+        if word.phrase_type not in PHRASE_TYPES:
+            raise CardValidationError(
+                "phrase requires fixed, collocation, or frame phrase_type"
+            )
+        lexical_parts = re.findall(r"[^\W\d_]+", word.lemma, flags=re.UNICODE)
+        if len(lexical_parts) < 2:
+            raise CardValidationError("phrase requires at least two lexical parts")
+        if word.phrase_type == "frame" and not re.search(r"\.{3}|…", word.lemma):
+            raise CardValidationError("phrase frame requires an ellipsis placeholder")
 
     warnings: list[str] = []
-    if word.example and word.headword.lower() not in word.example.lower():
+    if (
+        not isinstance(word, Phrase)
+        and word.example
+        and word.headword.lower() not in word.example.lower()
+    ):
         warnings.append("example does not contain the literal headword; inflected form may still be valid")
     return warnings

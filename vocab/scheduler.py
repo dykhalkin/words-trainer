@@ -13,7 +13,9 @@ from psycopg.types.json import Jsonb
 
 from . import db, grading, reminders, srs, statistics
 from .exercises import GENERATORS, GeneratedExercise
+from .exercises.base import display_card_lemma, display_lemma, short_verb_tense_strip
 from .languages import ExerciseContext, language_spec, normalize_lemma
+from .models import Phrase, Verb, Word
 
 STAGE_TYPES = {
     0: ["choice"],
@@ -22,6 +24,12 @@ STAGE_TYPES = {
     3: ["cloze", "grammar", "flashcard_ru_de"],
 }
 FALLBACK = ["flashcard_ru_de", "choice"]
+PHRASE_STAGE_TYPES = {
+    0: ["choice"],
+    1: ["flashcard_ru_de"],
+    2: ["phrase_cloze", "flashcard_ru_de"],
+    3: ["phrase_context", "phrase_cloze", "flashcard_ru_de"],
+}
 DEFAULT_NEW_SCAN = 5
 STARTED_SCAN_LIMIT = 100
 TASK_TTL = timedelta(hours=24)
@@ -31,6 +39,22 @@ QUICK_SESSION_TTL = timedelta(minutes=5)
 
 def _stage(row: dict[str, Any]) -> int:
     return srs.stage(int(row.get("reps") or 0), float(row.get("interval_days") or 0))
+
+
+def _stage_task_types(word: Word, stage: int, rng: random.Random) -> list[str]:
+    """Return the normal exercise rotation for this card and learning stage."""
+    stage_types = (
+        list(PHRASE_STAGE_TYPES[stage])
+        if isinstance(word, Phrase)
+        else list(STAGE_TYPES[stage])
+    )
+    if isinstance(word, Verb) and stage == 2:
+        stage_types.append("grammar")
+    if (isinstance(word, Verb) and stage in {2, 3}) or (
+        isinstance(word, Phrase) and stage == 3
+    ):
+        rng.shuffle(stage_types)
+    return stage_types
 
 
 async def _candidate_rows(
@@ -262,6 +286,8 @@ async def create_task(
                     return None
                 if session["deck_id"] is not None:
                     deck_id = session["deck_id"]
+                if session["kind"] == "context":
+                    return None
                 if session["kind"] == "quick":
                     task_type = await _quick_task_type(conn, session["id"])
                 if (
@@ -300,7 +326,8 @@ async def create_task(
                     return None
                 types = [task_type]
             else:
-                types = [name for name in STAGE_TYPES[stage] if name in allowed]
+                stage_types = _stage_task_types(word, stage, rng)
+                types = [name for name in stage_types if name in allowed]
                 types.extend(name for name in FALLBACK if name in allowed and name not in types)
             produced: GeneratedExercise | None = None
             selected_type = ""
@@ -364,7 +391,7 @@ async def create_task(
             return {
                 "task_id": task_id,
                 "type": selected_type,
-                "word": word.lemma,
+                "word": display_lemma(word),
                 "word_id": row["id"],
                 "language": word.language,
                 "stage": stage,
@@ -437,12 +464,15 @@ async def _commit_review(
         "SELECT * FROM progress WHERE word_id = %s FOR UPDATE", (task["word_id"],)
     )
     progress = await progress_result.fetchone()
-    apply_srs = (
-        task.get("session_kind") != "quick"
-        or progress is None
-        or progress["due_at"] is None
-        or progress["due_at"] <= now
-    )
+    if task.get("session_kind") == "context":
+        apply_srs = False
+    else:
+        apply_srs = (
+            task.get("session_kind") != "quick"
+            or progress is None
+            or progress["due_at"] is None
+            or progress["due_at"] <= now
+        )
     if apply_srs:
         schedule = srs.review(
             reps=progress["reps"] if progress else 0,
@@ -471,14 +501,19 @@ async def _commit_review(
         interval_days = schedule.interval_days
         stage = srs.stage(schedule.reps, schedule.interval_days)
     else:
-        existing_due_at = progress["due_at"]
-        next_review_at = (
-            existing_due_at.isoformat(timespec="seconds")
-            if isinstance(existing_due_at, datetime)
-            else existing_due_at
-        )
-        interval_days = float(progress["interval_days"])
-        stage = srs.stage(progress["reps"], interval_days)
+        if progress:
+            existing_due_at = progress["due_at"]
+            next_review_at = (
+                existing_due_at.isoformat(timespec="seconds")
+                if isinstance(existing_due_at, datetime)
+                else existing_due_at
+            )
+            interval_days = float(progress["interval_days"])
+            stage = srs.stage(progress["reps"], interval_days)
+        else:
+            next_review_at = None
+            interval_days = 0.0
+            stage = 0
     verdict = {
         "correct": correct,
         "expected": expected,
@@ -532,7 +567,9 @@ async def _commit_review(
                     (task["session_id"],),
                 )
     card = _json_object(task["card"])
-    return {
+    expected_data = _json_object(task["expected"])
+    visible_word = display_card_lemma(card, task["lemma"])
+    result = {
         "task_id": task["id"],
         "correct": correct,
         "expected": expected,
@@ -540,9 +577,12 @@ async def _commit_review(
         "grader_feedback": grader_feedback,
         "grading_source": grading_source,
         "answer_evaluation_id": evaluation_id,
-        "word": task["lemma"],
+        "word": visible_word,
+        "kind": card.get("kind", "other"),
         "translation": card.get("translation", ""),
-        "example": card.get("example", ""),
+        "example": (
+            "" if task["type"] == "context_llm" else card.get("example", "")
+        ),
         "next_review_at": next_review_at,
         "interval_days": interval_days,
         "stage": verdict["stage"],
@@ -550,10 +590,21 @@ async def _commit_review(
         "session_answered_count": session_answered_count,
         "session_correct_count": session_correct_count,
     }
+    tense_strip = short_verb_tense_strip(card)
+    if tense_strip:
+        result["tense_strip"] = tense_strip
+    if task["type"] == "context_llm":
+        result["context_explanation"] = expected_data.get("explanation_ru", "")
+        result["practice_only"] = True
+    return result
 
 
 def _evaluation_context(task: dict[str, Any]) -> dict[str, Any]:
     payload = _json_object(task["payload"])
+    card = _json_object(task["card"])
+    visible_word = display_card_lemma(card, task["lemma"])
+    if card.get("kind") in {"noun", "verb_prep"}:
+        card["lemma"] = visible_word
     return {
         "language": task["language"],
         "answer_language": task["answer_language"],
@@ -565,8 +616,8 @@ def _evaluation_context(task: dict[str, Any]) -> dict[str, Any]:
             "grading_policy": task["grading_policy"],
         },
         "expected": _json_object(task["expected"]),
-        "word": task["lemma"],
-        "card": _json_object(task["card"]),
+        "word": visible_word,
+        "card": card,
     }
 
 
@@ -830,6 +881,10 @@ async def task_context(
         )
     if not row:
         return None
+    card = _json_object(row["card"])
+    visible_word = display_card_lemma(card, row["lemma"])
+    if card.get("kind") in {"noun", "verb_prep"}:
+        card["lemma"] = visible_word
     output = {
         "task_id": row["id"],
         "word_id": row["word_id"],
@@ -839,8 +894,8 @@ async def task_context(
         "answer_language": row["answer_language"],
         "grading_policy": row["grading_policy"],
         "payload": _json_object(row["payload"]),
-        "word": row["lemma"],
-        "card": _json_object(row["card"]),
+        "word": visible_word,
+        "card": card,
         "answer": row["answer"],
         "verdict": _json_object(row["verdict"]) if row["verdict"] else None,
     }
@@ -872,8 +927,8 @@ async def start_session(
     deck_id: int | None = None,
     target_count: int | None = None,
 ) -> dict[str, Any]:
-    if kind not in {"micro", "long", "quick"}:
-        raise ValueError("session kind must be micro, long, or quick")
+    if kind not in {"micro", "long", "quick", "context"}:
+        raise ValueError("session kind must be micro, long, quick, or context")
     if kind == "micro" and target_count is None:
         target_count = 5
     session_id = uuid.uuid4().hex[:16]

@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from tests.support import temporary_database
 from vocab import db, reminders, scheduler, words
-from vocab.models import Word
+from vocab.models import Verb, Word
 
 
 def make_word(lemma: str, translation: str) -> Word:
@@ -19,6 +19,32 @@ def make_word(lemma: str, translation: str) -> Word:
         example=f"Das ist {lemma}.",
         pronunciation=lemma,
         source_file="test.csv",
+    )
+
+
+def make_verb() -> Verb:
+    return Verb(
+        lemma="aufbauen",
+        kind="verb",
+        translation="строить",
+        example="Sie baut ein Haus auf.",
+        pronunciation="ауфбауэн",
+        source_file="test.csv",
+        conjugation={
+            "praesens": [
+                "ich baue auf", "du baust auf", "er/es/sie baut auf",
+                "wir bauen auf", "ihr baut auf", "Sie bauen auf",
+            ],
+            "perfekt": [
+                "ich habe aufgebaut", "du hast aufgebaut",
+                "er/es/sie hat aufgebaut", "wir haben aufgebaut",
+                "ihr habt aufgebaut", "Sie haben aufgebaut",
+            ],
+            "praeteritum": [
+                "ich baute auf", "du bautest auf", "er/es/sie baute auf",
+                "wir bauten auf", "ihr bautet auf", "Sie bauten auf",
+            ],
+        },
     )
 
 
@@ -79,6 +105,37 @@ class SessionIntegrityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("expected", answered_context)
         self.assertEqual(answered_context["answer"], "один")
         self.assertNotIn("example", answered_context["verdict"])
+
+    async def test_verb_verdict_includes_the_short_tense_strip(self) -> None:
+        verb, _ = await words.add_word(
+            self.database,
+            user_id=self.owner["id"],
+            language="de",
+            deck_id=self.deck["id"],
+            word=make_verb(),
+        )
+        task = await scheduler.create_task(
+            self.database,
+            self.owner["id"],
+            word_id=verb["id"],
+            task_type="flashcard_ru_de",
+        )
+
+        verdict = await scheduler.submit_answer(
+            self.database, self.owner["id"], task["task_id"], "aufbauen"
+        )
+
+        self.assertEqual(
+            verdict["tense_strip"],
+            {
+                "person": "er/es/sie",
+                "forms": [
+                    {"tense": "Präsens", "form": "baut auf"},
+                    {"tense": "Perfekt", "form": "hat aufgebaut"},
+                    {"tense": "Präteritum", "form": "baute auf"},
+                ],
+            },
+        )
 
     async def test_concurrent_answers_commit_one_review_and_transition(self) -> None:
         task = await scheduler.create_task(

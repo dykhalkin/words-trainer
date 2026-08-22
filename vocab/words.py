@@ -21,7 +21,7 @@ from .languages import (
     normalize_spaces,
     validate_word,
 )
-from .models import Noun, Verb, VerbPrep, Word
+from .models import PHRASE_TYPES, Noun, Phrase, Verb, VerbPrep, Word
 
 ARCHIVE_DECK_NAME = "Archive"
 RESERVED_DECK_NAMES = {normalize_deck_name(ARCHIVE_DECK_NAME)}
@@ -37,7 +37,7 @@ class WordCard(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     lemma: str = Field(min_length=1)
-    kind: Literal["noun", "verb", "verb_prep", "other"]
+    kind: Literal["noun", "verb", "verb_prep", "phrase", "other"]
     translation: str = Field(min_length=1)
     example: str = Field(min_length=1)
     pronunciation: str = Field(min_length=1)
@@ -48,6 +48,7 @@ class WordCard(BaseModel):
     verb: str | None = None
     preposition: str | None = None
     case: str | None = None
+    phrase_type: Literal["fixed", "collocation", "frame"] | None = None
 
     @model_validator(mode="after")
     def validate_kind_fields(self) -> "WordCard":
@@ -57,6 +58,8 @@ class WordCard(BaseModel):
             raise ValueError("verb requires conjugation")
         if self.kind == "verb_prep" and not all((self.verb, self.preposition, self.case)):
             raise ValueError("verb_prep requires verb, preposition, and case")
+        if self.kind == "phrase" and self.phrase_type not in PHRASE_TYPES:
+            raise ValueError("phrase requires fixed, collocation, or frame phrase_type")
         return self
 
     def to_word(self, *, source_file: str = "agent") -> Word:
@@ -83,6 +86,11 @@ class WordCard(BaseModel):
                 verb=normalize_spaces(self.verb or ""),
                 preposition=normalize_spaces(self.preposition or ""),
                 case=normalize_spaces(self.case or ""),
+            )
+        if self.kind == "phrase":
+            return Phrase(
+                **common,
+                phrase_type=str(self.phrase_type),
             )
         return Word(**common)
 

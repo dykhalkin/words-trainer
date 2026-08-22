@@ -6,10 +6,10 @@ import unittest
 from pydantic import ValidationError
 
 from tests.support import temporary_database
-from vocab import db, words
+from vocab import db, scheduler, words
 from vocab.exercises import choice, grammar
 from vocab.languages import ExerciseContext, language_spec
-from vocab.models import PERSONS, TENSES, Verb, Word
+from vocab.models import PERSONS, TENSES, Phrase, Verb, Word
 
 
 def simple_word(lemma: str, translation: str) -> Word:
@@ -112,6 +112,69 @@ class WordLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "two-letter code"):
             await words.create_deck(
                 self.database, self.owner["id"], "not-a-language", "Invalid"
+            )
+
+    async def test_phrase_cards_are_language_independent_and_use_phrase_exercises(self) -> None:
+        french = await words.create_deck(
+            self.database, self.owner["id"], "fr", "French phrases"
+        )
+        staged = await words.stage_cards(
+            self.database,
+            user_id=self.owner["id"],
+            deck_id=french["id"],
+            cards=[
+                {
+                    "lemma": "prendre une décision",
+                    "kind": "phrase",
+                    "phrase_type": "collocation",
+                    "translation": "принять решение",
+                    "example": "Je dois prendre une décision.",
+                    "pronunciation": "прандр юн десизьон",
+                }
+            ],
+        )
+        committed = await words.commit_pending(
+            self.database, self.owner["id"], staged["pending_id"]
+        )
+        stored = await words.get_word(
+            self.database, self.owner["id"], committed["word_ids"][0]
+        )
+        self.assertIsInstance(stored, Phrase)
+        self.assertEqual(stored.phrase_type, "collocation")
+        self.assertIn("phrase_cloze", language_spec("fr").exercise_types)
+        self.assertIn("phrase_context", language_spec("fr").exercise_types)
+
+        async with self.database.connection() as conn:
+            await conn.execute(
+                """INSERT INTO progress(word_id, reps, interval_days, due_at)
+                   VALUES (%s, 3, 8, now())""",
+                (stored.db_id,),
+            )
+        task = await scheduler.create_task(
+            self.database, self.owner["id"], word_id=stored.db_id
+        )
+        self.assertEqual(task["type"], "phrase_cloze")
+        self.assertEqual(task["answer_language"], "fr")
+        context_task = await scheduler.create_task(
+            self.database,
+            self.owner["id"],
+            word_id=stored.db_id,
+            task_type="phrase_context",
+        )
+        self.assertEqual(context_task["type"], "phrase_context")
+        self.assertIn("короткую реплику", context_task["prompt"])
+
+        with self.assertRaisesRegex(ValueError, "ellipsis"):
+            words.validate_card(
+                "fr",
+                {
+                    "lemma": "cela dépend de la météo",
+                    "kind": "phrase",
+                    "phrase_type": "frame",
+                    "translation": "это зависит от погоды",
+                    "example": "Cela dépend de la météo.",
+                    "pronunciation": "села депан",
+                },
             )
 
     async def test_delete_deck_requires_an_empty_deck(self) -> None:

@@ -16,12 +16,18 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
-from .models import Noun, Verb, VerbPrep, Word
+from .models import Noun, Phrase, Verb, VerbPrep, Word
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS_DIR = Path(__file__).with_name("migrations")
 DEFAULT_DATABASE_URL = "postgresql://words_trainer:words_trainer_dev@127.0.0.1:55432/words_trainer"
-WORD_CLASSES = {"noun": Noun, "verb": Verb, "verb_prep": VerbPrep, "other": Word}
+WORD_CLASSES = {
+    "noun": Noun,
+    "verb": Verb,
+    "verb_prep": VerbPrep,
+    "phrase": Phrase,
+    "other": Word,
+}
 
 
 class DatabaseUnavailable(RuntimeError):

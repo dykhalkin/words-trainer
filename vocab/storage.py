@@ -4,6 +4,7 @@ Row kind is detected per line:
 - 22 columns -> verb with full conjugation (4 base + 6 Praesens + 6 Perfekt + 6 Praeteritum)
 - first column like "der/die/das X (die Xe)" -> noun
 - first column like "denken an + Akk" -> verb with preposition
+- fifth column like "phrase:fixed" -> a phrase card
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from .languages import (
     normalize_spaces,
     validate_word,
 )
-from .models import TENSES, Noun, Verb, VerbPrep, Word
+from .models import PHRASE_TYPES, TENSES, Noun, Phrase, Verb, VerbPrep, Word
 from .words import RESERVED_DECK_NAMES, _find_deck, _insert_or_reuse_word
 
 NOUN_RE = re.compile(r"^(der|die|das)\s+(.+?)\s*(?:\((.+?)\))?$", re.IGNORECASE)
@@ -48,6 +49,19 @@ def parse_row(row: list[str], source_file: str) -> Word | None:
             tense: row[4 + i * 6 : 10 + i * 6] for i, tense in enumerate(TENSES)
         }
         return Verb(lemma=lemma, kind="verb", conjugation=conjugation, **common)
+
+    if len(row) >= 5 and row[4].casefold().startswith("phrase:"):
+        phrase_type = row[4].split(":", 1)[1].strip().casefold()
+        if phrase_type not in PHRASE_TYPES:
+            raise ValueError(
+                "phrase CSV marker must be phrase:fixed, phrase:collocation, or phrase:frame"
+            )
+        return Phrase(
+            lemma=lemma,
+            kind="phrase",
+            phrase_type=phrase_type,
+            **common,
+        )
 
     m = PREP_RE.match(lemma)
     if m:
@@ -105,6 +119,14 @@ def word_to_row(word: Word) -> list[str]:
         if word.plural_full:
             label = f"{label} ({word.plural_full})"
         return [label, word.translation, word.example, word.pronunciation]
+    if isinstance(word, Phrase):
+        return [
+            word.lemma,
+            word.translation,
+            word.example,
+            word.pronunciation,
+            f"phrase:{word.phrase_type}",
+        ]
     return [word.lemma, word.translation, word.example, word.pronunciation]
 
 

@@ -35,6 +35,11 @@ class QuickDeckCallback(CallbackData, prefix="qd"):
     page: int = 0
 
 
+class ContextDeckCallback(CallbackData, prefix="cd"):
+    deck_id: int
+    page: int = 0
+
+
 class StatsDeckCallback(CallbackData, prefix="sd"):
     deck_id: int
     page: int = 0
@@ -97,16 +102,20 @@ def deck_picker_keyboard(
     page: int = 0,
     stats: bool = False,
     quick: bool = False,
+    context_mode: bool = False,
     page_size: int = 6,
 ) -> InlineKeyboardMarkup:
-    if stats and quick:
-        raise ValueError("deck picker cannot select stats and quick mode together")
+    if sum((stats, quick, context_mode)) > 1:
+        raise ValueError("deck picker modes are mutually exclusive")
     decks = [deck for deck in decks if not deck.get("is_archive", False)]
-    callback_type = (
-        StatsDeckCallback
-        if stats
-        else QuickDeckCallback if quick else PracticeDeckCallback
-    )
+    if stats:
+        callback_type = StatsDeckCallback
+    elif context_mode:
+        callback_type = ContextDeckCallback
+    elif quick:
+        callback_type = QuickDeckCallback
+    else:
+        callback_type = PracticeDeckCallback
     start = page * page_size
     visible = decks[start : start + page_size]
     rows: list[list[InlineKeyboardButton]] = []

@@ -144,6 +144,13 @@ class ImportExportTests(unittest.IsolatedAsyncioTestCase):
             ["halten", "держать", "Er hält die Tür.", "hal-ten", *forms],
             ["denken an + Akk", "думать о", "Ich denke an dich.", "den-ken"],
             ["Fieber haben", "иметь температуру", "Ich habe Fieber.", "fee-ber"],
+            [
+                "auf jeden Fall",
+                "в любом случае",
+                "Ich komme auf jeden Fall.",
+                "ауф-йеден-фаль",
+                "phrase:fixed",
+            ],
         ]
         write_csv(path, rows)
         imported = await storage.import_csv(
@@ -157,10 +164,17 @@ class ImportExportTests(unittest.IsolatedAsyncioTestCase):
             deck_id=imported["deck_id"],
         )
         parsed = storage.load_file(exported_path)
-        self.assertEqual(exported["rows"], 4)
-        self.assertEqual([word.kind for word in parsed], ["noun", "verb", "verb_prep", "other"])
+        self.assertEqual(exported["rows"], 5)
+        self.assertEqual(
+            [word.kind for word in parsed],
+            ["noun", "verb", "verb_prep", "other", "phrase"],
+        )
         self.assertEqual([word.lemma for word in parsed], [
-            "die Salbe", "halten", "denken an + Akk", "Fieber haben"
+            "die Salbe",
+            "halten",
+            "denken an + Akk",
+            "Fieber haben",
+            "auf jeden Fall",
         ])
 
     async def test_real_csv_counts(self) -> None:

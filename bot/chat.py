@@ -12,6 +12,7 @@ from aiogram.types import CallbackQuery, Message
 from vocab import db, llm, reminders, scheduler, words
 
 from .agent import TutorService
+from .context import ContextExerciseService
 from .drill import finish_answer, send_task
 from .grader import TutorGraderService
 from .keyboards import ExplainCallback, PendingCallback, pending_keyboard
@@ -26,7 +27,8 @@ def proposal_text(row: dict[str, Any]) -> str:
     cards = json.loads(raw) if isinstance(raw, str) else list(raw)
     lines = [f"Предложение для колоды «{row['deck_name']}»:" ]
     for card in cards:
-        lines.append(f"• {card['lemma']} — {card['translation']}")
+        prefix = "Фраза: " if card.get("kind") == "phrase" else ""
+        lines.append(f"• {prefix}{card['lemma']} — {card['translation']}")
     lines.append("\nДобавить эти карточки?")
     return "\n".join(lines)
 
@@ -62,13 +64,16 @@ async def send_tutor_reply(
 
 
 async def _resume_training_if_needed(
-    message: Message, database: db.Database, learner: dict[str, Any]
+    message: Message,
+    database: db.Database,
+    learner: dict[str, Any],
+    context_generator: ContextExerciseService,
 ) -> None:
     if (
         not await scheduler.get_open_task(database, learner["id"])
         and await scheduler.get_open_session(database, learner["id"])
     ):
-        await send_task(message, database, learner)
+        await send_task(message, database, learner, context_generator)
 
 
 async def handle_card_feedback(
@@ -76,6 +81,7 @@ async def handle_card_feedback(
     database: db.Database,
     learner: dict[str, Any],
     tutor: TutorService,
+    context_generator: ContextExerciseService,
 ) -> bool:
     pending = await reminders.get_pending_action(database, learner["id"])
     if not pending or pending["kind"] != "card_feedback":
@@ -103,7 +109,9 @@ async def handle_card_feedback(
             "Комментарий сохранён, карточка исключена из тренировок. "
             "Tutor сейчас недоступен, поэтому она осталась в списке /issues."
         )
-        await _resume_training_if_needed(message, database, learner)
+        await _resume_training_if_needed(
+            message, database, learner, context_generator
+        )
         return True
     status = await message.answer("Tutor проверяет комментарий и исправляет карточку…")
     try:
@@ -118,7 +126,9 @@ async def handle_card_feedback(
             "Комментарий сохранён, но лимит tutor исчерпан. "
             "Карточка осталась в списке /issues."
         )
-        await _resume_training_if_needed(message, database, learner)
+        await _resume_training_if_needed(
+            message, database, learner, context_generator
+        )
         return True
     except Exception:
         logger.exception("card correction failed")
@@ -126,14 +136,16 @@ async def handle_card_feedback(
             "Комментарий сохранён, но tutor не смог обновить карточку. "
             "Она осталась в списке /issues."
         )
-        await _resume_training_if_needed(message, database, learner)
+        await _resume_training_if_needed(
+            message, database, learner, context_generator
+        )
         return True
     card = correction.corrected_card
     await status.edit_text(
         f"Карточка обновлена: {card.lemma} — {card.translation}\n"
         f"{correction.summary_ru}"
     )
-    await _resume_training_if_needed(message, database, learner)
+    await _resume_training_if_needed(message, database, learner, context_generator)
     return True
 
 
@@ -144,8 +156,11 @@ async def text_answer_or_chat(
     learner: dict[str, Any],
     tutor: TutorService,
     grader: TutorGraderService,
+    context_generator: ContextExerciseService,
 ) -> None:
-    if await handle_card_feedback(message, database, learner, tutor):
+    if await handle_card_feedback(
+        message, database, learner, tutor, context_generator
+    ):
         return
     task = await scheduler.get_open_task(database, learner["id"])
     if task:
@@ -157,6 +172,7 @@ async def text_answer_or_chat(
             message.text or "",
             edit=False,
             grader=grader,
+            context_generator=context_generator,
         )
         return
     if await handle_pending_text(message, database, learner):

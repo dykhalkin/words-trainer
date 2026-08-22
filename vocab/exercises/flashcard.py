@@ -14,8 +14,15 @@ from typing import Any
 from psycopg import AsyncConnection
 
 from ..languages import ExerciseContext, language_spec
-from ..models import Noun, VerbPrep, Word
-from .base import CheckResult, GeneratedExercise, check_text
+from ..models import Noun, Phrase, Verb, VerbPrep, Word
+from .base import (
+    CheckResult,
+    GeneratedExercise,
+    check_text,
+    display_lemma,
+    reflexive_verb_variants,
+    verb_prep_answer_variants,
+)
 
 
 def translation_variants(translation: str) -> list[str]:
@@ -35,7 +42,7 @@ class DeRu:
         rng: random.Random,
         context: ExerciseContext,
     ):
-        payload = {"prompt": f"Переведи на русский: «{word.lemma}»"}
+        payload = {"prompt": f"Переведи на русский: «{display_lemma(word)}»"}
         expected = {"translation": word.translation}
         return payload, expected
 
@@ -53,9 +60,11 @@ class RuDe:
         rng: random.Random,
         context: ExerciseContext,
     ):
+        visible_word = display_lemma(word)
         hints = {
             "noun": " (с артиклем)",
             "verb_prep": " (с предлогом и падежом)",
+            "phrase": " (целиком фразой)",
         }
         payload = {
             "prompt": (
@@ -64,10 +73,20 @@ class RuDe:
             )
         }
         expected = {
-            "lemma": word.lemma,
+            "lemma": visible_word,
             "kind": word.kind,
-            "headword": word.headword,
+            "headword": visible_word if isinstance(word, Noun) else word.headword,
         }
+        if isinstance(word, Verb):
+            expected["reflexive"] = word.lemma.casefold().startswith("sich ")
+        elif isinstance(word, VerbPrep):
+            expected.update(
+                verb=word.verb,
+                preposition=word.preposition,
+                case=word.case,
+            )
+        elif isinstance(word, Phrase):
+            expected["phrase_type"] = word.phrase_type
         return GeneratedExercise(
             payload, expected, "free_text", context.language, "tutor_on_mismatch"
         )
@@ -75,4 +94,17 @@ class RuDe:
     @staticmethod
     def check(expected: dict, answer: str) -> CheckResult:
         lemma = expected["lemma"]
-        return check_text(answer, [lemma], lemma, exact_quality=5)
+        accepted = [lemma]
+        if expected.get("kind") == "verb" and (
+            expected.get("reflexive") or lemma.casefold().startswith("sich ")
+        ):
+            accepted = reflexive_verb_variants(lemma)
+        elif expected.get("kind") == "verb_prep":
+            if expected.get("preposition") and expected.get("case"):
+                accepted += verb_prep_answer_variants(
+                    str(expected.get("verb") or expected.get("headword") or ""),
+                    str(expected["preposition"]),
+                    str(expected["case"]),
+                    include_verb=True,
+                )
+        return check_text(answer, accepted, lemma, exact_quality=5)

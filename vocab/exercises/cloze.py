@@ -9,7 +9,7 @@ from typing import Any
 from psycopg import AsyncConnection
 
 from ..languages import ExerciseContext
-from ..models import Noun, Verb, Word
+from ..models import Noun, Phrase, Verb, Word
 from .base import CheckResult, GeneratedExercise, check_text, fold_umlauts
 
 UMLAUT_MAP = [("au", "äu"), ("a", "ä"), ("o", "ö"), ("u", "ü")]
@@ -21,8 +21,6 @@ SEPARABLE_PREFIXES = (
 
 
 def candidate_forms(word: Word) -> set[str]:
-    if isinstance(word, Noun):
-        return {f for f in (word.singular, word.plural_noun) if f}
     if isinstance(word, Verb):
         return word.all_form_tokens() | {word.lemma}
     return set()
@@ -85,6 +83,10 @@ async def generate(
     rng: random.Random,
     context: ExerciseContext,
 ):
+    # A noun cloze necessarily isolates an inflected bare noun or article. Both
+    # violate the full-form invariant, so nouns use recall and grammar instead.
+    if isinstance(word, (Noun, Phrase)):
+        return None
     if not word.example:
         return None
     target = find_blank(word)

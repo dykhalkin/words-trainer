@@ -10,7 +10,14 @@ from psycopg import AsyncConnection
 from .. import db
 from ..languages import ExerciseContext
 from ..models import PERSONS, Noun, Verb, VerbPrep, Word
-from .base import CheckResult, GeneratedExercise, check_text
+from .base import (
+    CheckResult,
+    GeneratedExercise,
+    check_text,
+    display_lemma,
+    display_rection,
+    verb_prep_answer_variants,
+)
 
 TENSE_NAMES = {"praesens": "Präsens", "perfekt": "Perfekt", "praeteritum": "Präteritum"}
 
@@ -39,27 +46,30 @@ async def generate(
 
 
 def _noun_task(word: Noun, rng: random.Random):
-    subtypes = ["article"] + (["plural"] if word.plural_noun else [])
+    visible_word = display_lemma(word)
+    singular = visible_word.split(" ", 1)[1]
+    subtypes = ["article"] + (["plural"] if word.plural_full else [])
     subtype = rng.choice(subtypes)
     if subtype == "article":
+        options = [f"{article} {singular}" for article in ("der", "die", "das")]
         payload = {
-            "prompt": f"Какой артикль у слова «{word.singular}» ({word.translation})?",
-            "options": ["der", "die", "das"],
+            "prompt": f"Выбери правильную полную форму: «{word.translation}».",
+            "options": options,
         }
         expected = {
             "sub": "article",
-            "answer": word.article,
-            "accepted": [word.article],
-            "options": payload["options"],
+            "answer": visible_word,
+            "accepted": [visible_word],
+            "options": options,
         }
     else:
         payload = {
-            "prompt": f"Wie lautet der Plural von «{word.lemma}» ({word.translation})?",
+            "prompt": f"Wie lautet der Plural von «{visible_word}» ({word.translation})?",
         }
         expected = {
             "sub": "plural",
             "answer": word.plural_full,
-            "accepted": [word.plural_full, word.plural_noun],
+            "accepted": [word.plural_full],
         }
     return payload, expected
 
@@ -98,8 +108,13 @@ async def _prep_task(
         exclude_id=word_id,
         limit=12,
     )
-    pool = {w.rection for w in others if isinstance(w, VerbPrep)} - {word.rection}
-    options = rng.sample(sorted(pool), k=min(3, len(pool))) + [word.rection]
+    answer = display_rection(word.preposition, word.case)
+    pool = {
+        display_rection(w.preposition, w.case)
+        for w in others
+        if isinstance(w, VerbPrep)
+    } - {answer}
+    options = rng.sample(sorted(pool), k=min(3, len(pool))) + [answer]
     rng.shuffle(options)
     payload = {
         "prompt": f"«{word.verb}» ({word.translation}): какой предлог и падеж?",
@@ -107,8 +122,13 @@ async def _prep_task(
     }
     expected = {
         "sub": "rection",
-        "answer": word.rection,
-        "accepted": [word.rection, f"{word.preposition} {word.case}", word.preposition + word.case],
+        "answer": answer,
+        "accepted": verb_prep_answer_variants(
+            word.verb, word.preposition, word.case, include_verb=False
+        )
+        + verb_prep_answer_variants(
+            word.verb, word.preposition, word.case, include_verb=True
+        ),
         "options": options,
     }
     return payload, expected

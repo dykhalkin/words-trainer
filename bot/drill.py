@@ -12,10 +12,12 @@ from aiogram.types import CallbackQuery, Message
 
 from vocab import db, llm, reminders, scheduler, statistics, words
 
+from .context import ContextExerciseService
 from .grader import TutorGraderService
 
 from .keyboards import (
     AnswerCallback,
+    ContextDeckCallback,
     IssuesCallback,
     PracticeDeckCallback,
     QuickDeckCallback,
@@ -46,22 +48,63 @@ def _payload(value: Any) -> dict[str, Any]:
     return json.loads(value) if isinstance(value, str) else dict(value or {})
 
 
-async def send_task(message: Message, database: db.Database, learner: dict[str, Any]) -> None:
+async def send_task(
+    message: Message,
+    database: db.Database,
+    learner: dict[str, Any],
+    context_generator: ContextExerciseService | None = None,
+) -> None:
     session = await scheduler.get_open_session(database, learner["id"])
     if not session:
-        await message.answer("Сначала начните тренировку: /practice или /quick")
+        await message.answer(
+            "Сначала начните тренировку: /practice, /quick или /context"
+        )
         return
-    task = await scheduler.create_task(database, learner["id"], session_id=session["id"])
+    status: Message | None = None
+    if session["kind"] == "context":
+        status = await message.answer("Создаю новый контекст…")
+        if context_generator is None or not context_generator.available:
+            await scheduler.stop_session(database, learner["id"])
+            await status.edit_text("Контекстная тренировка недоступна: OpenAI не настроен.")
+            return
+        try:
+            task = await context_generator.create_task(
+                database, learner, session["id"]
+            )
+        except llm.BudgetExceeded:
+            await scheduler.stop_session(database, learner["id"])
+            await status.edit_text(
+                "Лимит LLM на этот месяц исчерпан. Контекстная тренировка остановлена."
+            )
+            return
+        except Exception:
+            logger.exception("context exercise generation failed")
+            await scheduler.stop_session(database, learner["id"])
+            await status.edit_text(
+                "Не удалось создать контекст. Попробуйте снова командой /context."
+            )
+            return
+    else:
+        task = await scheduler.create_task(
+            database, learner["id"], session_id=session["id"]
+        )
     if task is None:
         if scheduler.quick_session_expired(session):
-            await message.answer(session_summary(session) + "\nПять минут истекли.")
+            text = session_summary(session) + "\nПять минут истекли."
         else:
             stopped = await scheduler.stop_session(database, learner["id"])
-            await message.answer(session_summary(stopped) + "\nСейчас больше нечего повторять.")
+            text = session_summary(stopped) + "\nСейчас больше нечего повторять."
+        if status:
+            await status.edit_text(text)
+        else:
+            await message.answer(text)
         return
     options = list(task.get("options") or [])
     markup = answer_keyboard(task["task_id"], options)
-    await message.answer(task_text(task), reply_markup=markup)
+    if status:
+        await status.edit_text(task_text(task), reply_markup=markup)
+    else:
+        await message.answer(task_text(task), reply_markup=markup)
 
 
 async def finish_answer(
@@ -73,6 +116,7 @@ async def finish_answer(
     *,
     edit: bool,
     grader: TutorGraderService | None = None,
+    context_generator: ContextExerciseService | None = None,
 ) -> None:
     verdict = await scheduler.begin_answer_submission(
         database, learner["id"], task_id, answer
@@ -168,7 +212,7 @@ async def finish_answer(
             )
         )
         return
-    await send_task(message, database, learner)
+    await send_task(message, database, learner, context_generator)
 
 
 @router.callback_query(GradeCallback.filter())
@@ -178,6 +222,7 @@ async def resolve_grade_failure(
     database: db.Database,
     learner: dict[str, Any],
     grader: TutorGraderService,
+    context_generator: ContextExerciseService,
 ) -> None:
     if not isinstance(callback.message, Message):
         await callback.answer()
@@ -194,7 +239,7 @@ async def resolve_grade_failure(
             verdict_text(verdict),
             reply_markup=post_answer_keyboard(callback_data.task_id),
         )
-        await send_task(callback.message, database, learner)
+        await send_task(callback.message, database, learner, context_generator)
         return
     if callback_data.action != "retry":
         await callback.answer("Неизвестное действие")
@@ -215,6 +260,7 @@ async def resolve_grade_failure(
         evaluation["answer"],
         edit=False,
         grader=grader,
+        context_generator=context_generator,
     )
 
 
@@ -224,6 +270,7 @@ async def start(message: Message) -> None:
         "Я помогу регулярно повторять слова.\n\n"
         "/practice — длинная тренировка\n"
         "/quick — быстрая тренировка на 5 минут\n"
+        "/context — бесконечная практика в новых контекстах\n"
         "/decks — колоды\n"
         "/stats — статистика\n"
         "/howto — как работает обучение\n"
@@ -253,6 +300,23 @@ async def quick(message: Message, database: db.Database, learner: dict[str, Any]
     await message.answer(
         "Выберите колоду для быстрой тренировки:",
         reply_markup=deck_picker_keyboard(decks, quick=True),
+    )
+
+
+@router.message(Command("context"))
+async def context_practice(
+    message: Message, database: db.Database, learner: dict[str, Any]
+) -> None:
+    await reminders.clear_pending_action(database, learner["id"])
+    decks = [
+        row
+        for row in await words.list_decks(database, learner["id"])
+        if not row["is_archive"]
+    ]
+    await message.answer(
+        "Выберите колоду для контекстной практики. "
+        "Этот режим не изменяет стадии и интервалы:",
+        reply_markup=deck_picker_keyboard(decks, context_mode=True),
     )
 
 
@@ -373,6 +437,47 @@ async def choose_quick_deck(
     await send_task(callback.message, database, learner)
 
 
+@router.callback_query(ContextDeckCallback.filter())
+async def choose_context_deck(
+    callback: CallbackQuery,
+    callback_data: ContextDeckCallback,
+    database: db.Database,
+    learner: dict[str, Any],
+    context_generator: ContextExerciseService,
+) -> None:
+    if not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+    decks = [
+        row
+        for row in await words.list_decks(database, learner["id"])
+        if not row["is_archive"]
+    ]
+    if callback_data.deck_id == -1:
+        await callback.answer()
+        await callback.message.edit_reply_markup(
+            reply_markup=deck_picker_keyboard(
+                decks, page=callback_data.page, context_mode=True
+            )
+        )
+        return
+    deck_id = callback_data.deck_id or None
+    try:
+        await scheduler.start_session(
+            database, learner["id"], kind="context", deck_id=deck_id
+        )
+    except (LookupError, ValueError):
+        await callback.answer("Колода больше недоступна")
+        return
+    await callback.answer()
+    await callback.message.edit_text(
+        "Контекстная практика началась. Прогресс карточек не изменяется; "
+        "/stop — закончить.",
+        reply_markup=None,
+    )
+    await send_task(callback.message, database, learner, context_generator)
+
+
 @router.callback_query(StatsDeckCallback.filter())
 async def choose_stats_deck(
     callback: CallbackQuery,
@@ -463,6 +568,7 @@ async def word_action(
     callback_data: WordActionCallback,
     database: db.Database,
     learner: dict[str, Any],
+    context_generator: ContextExerciseService,
 ) -> None:
     if not isinstance(callback.message, Message):
         await callback.answer()
@@ -528,4 +634,4 @@ async def word_action(
         not await scheduler.get_open_task(database, learner["id"])
         and await scheduler.get_open_session(database, learner["id"])
     ):
-        await send_task(callback.message, database, learner)
+        await send_task(callback.message, database, learner, context_generator)

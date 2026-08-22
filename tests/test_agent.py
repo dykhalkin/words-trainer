@@ -10,11 +10,15 @@ from pydantic import SecretStr
 from bot.agent import (
     AgentConjugation,
     AgentWordCard,
+    CARD_CORRECTION_INSTRUCTIONS,
+    INSTRUCTIONS,
     CardCorrectionOutput,
     TOOLS,
     TutorService,
 )
 from bot.config import Settings
+from bot.context import CONTEXT_INSTRUCTIONS, ContextExerciseOutput
+from bot.grader import GRADER_INSTRUCTIONS
 from vocab import db, llm, scheduler, words
 from vocab.models import Word
 from tests.support import temporary_database
@@ -39,8 +43,64 @@ class AgentSchemaTests(unittest.TestCase):
             verb=None,
             preposition=None,
             case=None,
+            phrase_type=None,
         ).database_card()
         self.assertEqual(set(card.conjugation or {}), {"praesens", "perfekt", "praeteritum"})
+
+    def test_lm_rules_require_articles_for_every_german_noun(self) -> None:
+        self.assertIn("Never write or propose a bare German noun", INSTRUCTIONS)
+        self.assertIn("lemma must equal article + bare singular", CARD_CORRECTION_INSTRUCTIONS)
+        self.assertIn("missing or wrong article is rejected", GRADER_INSTRUCTIONS)
+        schema = AgentWordCard.model_json_schema()["properties"]
+        self.assertIn("full dictionary form with article", schema["lemma"]["description"])
+        self.assertIn("together with an explicit article", schema["example"]["description"])
+
+    def test_lm_rules_define_complete_and_compact_german_verbs(self) -> None:
+        self.assertIn("Präsens, Perfekt,\nand Präteritum", INSTRUCTIONS)
+        self.assertIn('"denken an Akk", without a plus sign', INSTRUCTIONS)
+        self.assertIn('"sich verstehen" and "verstehen sich"', GRADER_INSTRUCTIONS)
+        self.assertIn("Akkusativ", GRADER_INSTRUCTIONS)
+
+        card_schema = AgentWordCard.model_json_schema()["properties"]
+        self.assertIn("starts with 'sich'", card_schema["verb"]["description"])
+        self.assertIn("Akk or Dat", card_schema["case"]["description"])
+        conjugation_schema = AgentConjugation.model_json_schema()["properties"]
+        self.assertIn("Präsens", conjugation_schema["praesens"]["description"])
+        self.assertIn("Perfekt", conjugation_schema["perfekt"]["description"])
+        self.assertIn("Präteritum", conjugation_schema["praeteritum"]["description"])
+
+    def test_lm_rules_define_language_independent_phrase_cards(self) -> None:
+        card = AgentWordCard(
+            lemma="auf jeden Fall",
+            kind="phrase",
+            translation="в любом случае",
+            example="Ich komme auf jeden Fall.",
+            pronunciation="ауф йеден фаль",
+            article=None,
+            singular=None,
+            plural_full=None,
+            conjugation=None,
+            verb=None,
+            preposition=None,
+            case=None,
+            phrase_type="fixed",
+        ).database_card()
+        self.assertEqual(card.kind, "phrase")
+        self.assertEqual(card.phrase_type, "fixed")
+        self.assertIn("For any studied language", INSTRUCTIONS)
+        self.assertIn("A synonymous expression", GRADER_INSTRUCTIONS)
+        schema = AgentWordCard.model_json_schema()["properties"]
+        self.assertIn("collocation", schema["phrase_type"]["description"])
+
+    def test_context_generator_is_fresh_structured_and_low_stakes(self) -> None:
+        schema = ContextExerciseOutput.model_json_schema()["properties"]
+
+        self.assertIn("recent_contexts", CONTEXT_INSTRUCTIONS)
+        self.assertIn("never multiple choice", CONTEXT_INSTRUCTIONS)
+        self.assertIn("never\n  a bare noun", CONTEXT_INSTRUCTIONS)
+        self.assertIn("exercise_type=context_llm", GRADER_INSTRUCTIONS)
+        self.assertIn("required_elements", schema)
+        self.assertIn("context_tag", schema)
 
 
 class LlmPersistenceTests(unittest.IsolatedAsyncioTestCase):
@@ -120,6 +180,7 @@ class CardCorrectionTests(unittest.IsolatedAsyncioTestCase):
                 verb=None,
                 preposition=None,
                 case=None,
+                phrase_type=None,
             )
             calls: list[tuple] = []
 

@@ -14,6 +14,7 @@ from vocab import db, jobs as job_store
 from .config import Settings, load_settings
 from .agent import TutorService
 from .chat import router as chat_router
+from .context import ContextExerciseService
 from .curator import CuratorService
 from .drill import router
 from .grader import TutorGraderService
@@ -37,6 +38,7 @@ async def run(settings: Settings) -> None:
     dispatcher.include_router(chat_router)
     tutor = TutorService(settings)
     grader = TutorGraderService(settings)
+    context_generator = ContextExerciseService(settings)
     curator = CuratorService(settings)
     job_runner = BotJobRunner(database, bot, curator)
     scheduler = AsyncIOScheduler(job_defaults={"coalesce": True, "misfire_grace_time": 900})
@@ -87,6 +89,7 @@ async def run(settings: Settings) -> None:
             [
                 BotCommand(command="practice", description="длинная тренировка"),
                 BotCommand(command="quick", description="быстрая тренировка на 5 минут"),
+                BotCommand(command="context", description="практика в новых контекстах"),
                 BotCommand(command="decks", description="мои колоды"),
                 BotCommand(command="stats", description="статистика"),
                 BotCommand(command="howto", description="как работает обучение"),
@@ -97,7 +100,11 @@ async def run(settings: Settings) -> None:
         )
         scheduler.start()
         await dispatcher.start_polling(
-            bot, close_bot_session=False, tutor=tutor, grader=grader
+            bot,
+            close_bot_session=False,
+            tutor=tutor,
+            grader=grader,
+            context_generator=context_generator,
         )
     finally:
         if scheduler.running:

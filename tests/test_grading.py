@@ -13,7 +13,7 @@ from tests.support import temporary_database
 from vocab import db, scheduler, words
 from vocab.exercises import GENERATORS
 from vocab.grading import AnswerGrade, answer_hash
-from vocab.models import Noun, Word
+from vocab.models import Noun, VerbPrep, Word
 
 
 def make_word(lemma: str, translation: str) -> Word:
@@ -146,17 +146,17 @@ class TwoPhaseGradingTests(unittest.IsolatedAsyncioTestCase):
             language="de",
             deck_id=self.deck["id"],
             word=Noun(
-                lemma="die Salbe",
+                lemma="Salbe",
                 kind="noun",
                 translation="мазь",
                 example="Die Salbe hilft.",
                 pronunciation="zal-be",
                 article="die",
-                singular="Salbe",
+                singular="die Salbe",
                 plural_full="die Salben",
             ),
         )
-        for task_type in ("flashcard_ru_de", "cloze", "grammar"):
+        for task_type in ("flashcard_ru_de", "grammar"):
             generated.append(
                 await scheduler.create_task(
                     self.database,
@@ -165,6 +165,48 @@ class TwoPhaseGradingTests(unittest.IsolatedAsyncioTestCase):
                     task_type=task_type,
                 )
             )
+        self.assertTrue(
+            all(task["word"] == "die Salbe" for task in generated[-2:])
+        )
+        self.assertIsNone(
+            await scheduler.create_task(
+                self.database,
+                self.owner["id"],
+                word_id=noun["id"],
+                task_type="cloze",
+            )
+        )
+        prep, _ = await words.add_word(
+            self.database,
+            user_id=self.owner["id"],
+            language="de",
+            deck_id=self.deck["id"],
+            word=VerbPrep(
+                lemma="denken an + Akk",
+                kind="verb_prep",
+                translation="думать о",
+                example="Ich denke an dich.",
+                pronunciation="denken",
+                verb="denken",
+                preposition="an",
+                case="Akk",
+            ),
+        )
+        prep_task = await scheduler.create_task(
+            self.database,
+            self.owner["id"],
+            word_id=prep["id"],
+            task_type="flashcard_ru_de",
+        )
+        self.assertEqual(prep_task["word"], "denken an Akk")
+        prep_verdict = await scheduler.begin_answer_submission(
+            self.database,
+            self.owner["id"],
+            prep_task["task_id"],
+            "denken an Akkusativ",
+        )
+        self.assertTrue(prep_verdict["correct"])
+        self.assertEqual(prep_verdict["word"], "denken an Akk")
         french = await words.create_deck(
             self.database, self.owner["id"], "fr", "French"
         )

@@ -10,7 +10,7 @@ from psycopg import AsyncConnection
 from .. import db
 from ..languages import ExerciseContext
 from ..models import Word
-from .base import CheckResult, GeneratedExercise
+from .base import CheckResult, GeneratedExercise, display_lemma
 
 N_OPTIONS = 4
 
@@ -31,7 +31,7 @@ async def generate(
         limit=N_OPTIONS - 1,
     )
     if len(distractors) < N_OPTIONS - 1:  # tiny deck: take any kind
-        seen = {w.lemma for w in distractors}
+        seen = {display_lemma(w) for w in distractors}
         candidates = await db.sample_words(
             conn,
             user_id=context.user_id,
@@ -40,16 +40,17 @@ async def generate(
             limit=N_OPTIONS * 2,
         )
         for candidate in candidates:
-            if candidate.lemma not in seen:
+            candidate_lemma = display_lemma(candidate)
+            if candidate_lemma not in seen:
                 distractors.append(candidate)
-                seen.add(candidate.lemma)
+                seen.add(candidate_lemma)
             if len(distractors) == N_OPTIONS - 1:
                 break
     options = [w.translation for w in distractors] + [word.translation]
     rng.shuffle(options)
     correct_idx = options.index(word.translation)
     payload = {
-        "prompt": f"Что означает «{word.lemma}»?",
+        "prompt": f"Что означает «{display_lemma(word)}»?",
         "options": options,
     }
     expected = {"correct_index": correct_idx, "correct_text": word.translation}

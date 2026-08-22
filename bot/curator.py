@@ -56,12 +56,20 @@ and the explicit planning_constraints horizon. Never schedule before freeze_unti
 Never exceed minimum_gap_minutes or maximum_sends_per_policy_day. You may schedule fewer
 reminders only when deterministic input supports the chosen suppression reason. Return concise
 Russian notification text.
+When mentioning a German noun, preserve the full lemma with der/die/das; never omit its article.
+Keep sich for reflexive German meanings. Format verb-preposition cards compactly, such as
+"denken an Akk", without a plus sign.
+Treat a phrase as one learning unit in every language; preserve its full canonical form or frame.
 You cannot grade answers or modify progress.
 """
 
 CURATOR_DIGEST_INSTRUCTIONS = """You are a vocabulary-learning curator.
 Use only word IDs present in the supplied deterministic analysis.
 Prioritize repeated errors and weak exercise types. Return a short Russian digest.
+When mentioning a German noun, preserve the full lemma with der/die/das; never omit its article.
+Keep sich for reflexive German meanings. Format verb-preposition cards compactly, such as
+"denken an Akk", without a plus sign.
+Treat a phrase as one learning unit in every language; preserve its full canonical form or frame.
 You cannot grade answers or modify progress.
 """
 
