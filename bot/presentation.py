@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -47,6 +48,29 @@ def verdict_text(verdict: dict[str, Any]) -> str:
             label = f"Пример для «{word}»" if word else "Пример"
         lines.extend(("", f"{label}: {example}"))
     return "\n".join(lines)
+
+
+def youglish_query(value: dict[str, Any]) -> str:
+    """Build a learner-facing YouGlish query without card metadata."""
+    query = str(value.get("word") or "").strip()
+    card = value.get("card")
+    kind = value.get("kind")
+    if not kind and isinstance(card, dict):
+        kind = card.get("kind")
+    example = value.get("example")
+    if not example and isinstance(card, dict):
+        example = card.get("example")
+    if kind == "phrase" and re.search(r"(?:\.\.\.|…)", query) and example:
+        query = str(example).strip()
+    if kind == "verb_prep":
+        query = re.sub(
+            r"\s+(?:\+\s*)?(?:Akk|Dat|Gen|Nom)\.?$",
+            "",
+            query,
+            flags=re.IGNORECASE,
+        )
+    query = re.sub(r"(?:\.\.\.|…)", " ", query)
+    return re.sub(r"\s+", " ", query).strip()
 
 
 def session_summary(session: dict[str, Any] | None) -> str:

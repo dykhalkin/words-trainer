@@ -38,6 +38,7 @@ from .presentation import (
     stats_text,
     task_text,
     verdict_text,
+    youglish_query,
 )
 
 router = Router(name="drill")
@@ -190,7 +191,8 @@ async def finish_answer(
             await status.edit_text("Упражнение уже изменилось; результат проверки отброшен.")
             return
         await status.edit_text(
-            verdict_text(verdict), reply_markup=post_answer_keyboard(task_id)
+            verdict_text(verdict),
+            reply_markup=post_answer_keyboard(task_id, youglish_query(verdict)),
         )
         edit = False
     else:
@@ -198,10 +200,14 @@ async def finish_answer(
         if edit:
             original = message.text or "Упражнение"
             await message.edit_text(
-                f"{original}\n\n{rendered}", reply_markup=post_answer_keyboard(task_id)
+                f"{original}\n\n{rendered}",
+                reply_markup=post_answer_keyboard(task_id, youglish_query(verdict)),
             )
         else:
-            await message.answer(rendered, reply_markup=post_answer_keyboard(task_id))
+            await message.answer(
+                rendered,
+                reply_markup=post_answer_keyboard(task_id, youglish_query(verdict)),
+            )
     if verdict.get("session_complete"):
         await message.answer(
             session_summary(
@@ -237,7 +243,9 @@ async def resolve_grade_failure(
         await callback.answer()
         await callback.message.edit_text(
             verdict_text(verdict),
-            reply_markup=post_answer_keyboard(callback_data.task_id),
+            reply_markup=post_answer_keyboard(
+                callback_data.task_id, youglish_query(verdict)
+            ),
         )
         await send_task(callback.message, database, learner, context_generator)
         return
@@ -580,7 +588,9 @@ async def word_action(
     if callback_data.action == "cancel":
         await callback.answer()
         await callback.message.edit_reply_markup(
-            reply_markup=post_answer_keyboard(callback_data.task_id)
+            reply_markup=post_answer_keyboard(
+                callback_data.task_id, youglish_query(context)
+            )
         )
         return
     if callback_data.action == "flag":

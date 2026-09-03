@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import quote
+
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -188,9 +190,19 @@ def start_keyboard(delivery_id: int = 0) -> InlineKeyboardMarkup:
     )
 
 
-def post_answer_keyboard(task_id: str) -> InlineKeyboardMarkup:
+def youglish_url(query: str) -> str:
+    return f"https://youglish.com/pronounce/{quote(query, safe='')}/german"
+
+
+def post_answer_keyboard(task_id: str, query: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎬 В живой речи (YouGlish)",
+                    url=youglish_url(query),
+                )
+            ],
             [
                 InlineKeyboardButton(
                     text="Объяснить",

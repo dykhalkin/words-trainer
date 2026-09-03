@@ -21,6 +21,7 @@ from bot.keyboards import (
     answer_keyboard,
     deck_picker_keyboard,
     post_answer_keyboard,
+    youglish_url,
 )
 from bot.middleware import LearnerMiddleware, update_chat
 from bot.presentation import (
@@ -29,6 +30,7 @@ from bot.presentation import (
     stats_text,
     task_text,
     verdict_text,
+    youglish_query,
 )
 
 
@@ -49,12 +51,28 @@ class BotPresentationTests(unittest.TestCase):
         self.assertNotIn("⚠️ Ошибка", pre_answer_labels)
         post_answer_labels = [
             button.text
-            for row in post_answer_keyboard("1234567890abcdef").inline_keyboard
+            for row in post_answer_keyboard(
+                "1234567890abcdef", "auf jeden Fall"
+            ).inline_keyboard
             for button in row
         ]
         self.assertEqual(
-            post_answer_labels, ["Объяснить", "🗄 В архив", "⚠️ Ошибка"]
+            post_answer_labels,
+            [
+                "🎬 В живой речи (YouGlish)",
+                "Объяснить",
+                "🗄 В архив",
+                "⚠️ Ошибка",
+            ],
         )
+        youglish_button = post_answer_keyboard(
+            "1234567890abcdef", "die Straße"
+        ).inline_keyboard[0][0]
+        self.assertEqual(
+            youglish_button.url,
+            "https://youglish.com/pronounce/die%20Stra%C3%9Fe/german",
+        )
+        self.assertIsNone(youglish_button.callback_data)
         payloads = [
             PracticeDeckCallback(deck_id=123456789, page=99).pack(),
             QuickDeckCallback(deck_id=123456789, page=99).pack(),
@@ -71,6 +89,35 @@ class BotPresentationTests(unittest.TestCase):
             ReminderCallback(action="cadence", value="1440", revision=999999).pack(),
         ]
         self.assertTrue(all(len(value.encode()) <= 64 for value in payloads))
+
+    def test_youglish_query_removes_learning_metadata(self) -> None:
+        self.assertEqual(
+            youglish_query({"word": "denken an Akk", "kind": "verb_prep"}),
+            "denken an",
+        )
+        self.assertEqual(
+            youglish_query(
+                {
+                    "word": "es kommt auf … an",
+                    "card": {"kind": "phrase"},
+                }
+            ),
+            "es kommt auf an",
+        )
+        self.assertEqual(
+            youglish_query(
+                {
+                    "word": "es kommt auf … an",
+                    "kind": "phrase",
+                    "example": "Es kommt auf die Situation an.",
+                }
+            ),
+            "Es kommt auf die Situation an.",
+        )
+        self.assertEqual(
+            youglish_url("auf jeden Fall"),
+            "https://youglish.com/pronounce/auf%20jeden%20Fall/german",
+        )
 
     def test_archive_is_absent_from_deck_picker(self) -> None:
         decks = [
