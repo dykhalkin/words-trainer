@@ -90,6 +90,7 @@ async def run(settings: Settings) -> None:
                 BotCommand(command="practice", description="длинная тренировка"),
                 BotCommand(command="quick", description="быстрая тренировка на 5 минут"),
                 BotCommand(command="context", description="практика в новых контекстах"),
+                BotCommand(command="contrast", description="различия двух слов или фраз"),
                 BotCommand(command="decks", description="мои колоды"),
                 BotCommand(command="stats", description="статистика"),
                 BotCommand(command="howto", description="как работает обучение"),

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from html import escape
 from typing import Any
 
 from aiogram import Router
@@ -25,6 +26,8 @@ from .keyboards import (
     StatsDeckCallback,
     WordActionCallback,
     GradeCallback,
+    FlowCallback,
+    skip_keyboard,
     answer_keyboard,
     confirm_word_action_keyboard,
     deck_picker_keyboard,
@@ -34,6 +37,7 @@ from .keyboards import (
 )
 from .presentation import (
     learning_guide_text,
+    telegram_text_chunks,
     session_summary,
     stats_text,
     task_text,
@@ -54,6 +58,8 @@ async def send_task(
     database: db.Database,
     learner: dict[str, Any],
     context_generator: ContextExerciseService | None = None,
+    *,
+    previous_task_id: str | None = None,
 ) -> None:
     session = await scheduler.get_open_session(database, learner["id"])
     if not session:
@@ -65,35 +71,53 @@ async def send_task(
     if session["kind"] == "context":
         status = await message.answer("Создаю новый контекст…")
         if context_generator is None or not context_generator.available:
-            await scheduler.stop_session(database, learner["id"])
+            await scheduler.stop_session(
+                database, learner["id"], session_id=session["id"]
+            )
             await status.edit_text("Контекстная тренировка недоступна: OpenAI не настроен.")
             return
         try:
             task = await context_generator.create_task(
-                database, learner, session["id"]
+                database, learner, session["id"], previous_task_id=previous_task_id
             )
         except llm.BudgetExceeded:
-            await scheduler.stop_session(database, learner["id"])
+            await scheduler.stop_session(
+                database, learner["id"], session_id=session["id"]
+            )
             await status.edit_text(
                 "Лимит LLM на этот месяц исчерпан. Контекстная тренировка остановлена."
             )
             return
         except Exception:
             logger.exception("context exercise generation failed")
-            await scheduler.stop_session(database, learner["id"])
+            await scheduler.stop_session(
+                database, learner["id"], session_id=session["id"]
+            )
             await status.edit_text(
-                "Не удалось создать контекст. Попробуйте снова командой /context."
+                "Не удалось создать упражнение на различия. Повторите /contrast "
+                "или снова нажмите «Различия · 3 задания»."
+                if session.get("comparison")
+                else "Не удалось создать контекст. Попробуйте снова командой /context."
             )
             return
     else:
         task = await scheduler.create_task(
-            database, learner["id"], session_id=session["id"]
+            database,
+            learner["id"],
+            session_id=session["id"],
+            previous_task_id=previous_task_id,
         )
+    if task and task.get("already_active"):
+        if status:
+            await status.edit_text("Следующее упражнение уже выдано.")
+        return
     if task is None:
         if scheduler.quick_session_expired(session):
             text = session_summary(session) + "\nПять минут истекли."
         else:
-            stopped = await scheduler.stop_session(database, learner["id"])
+            stopped = await scheduler.stop_session(
+                database, learner["id"], session_id=session["id"]
+            )
             text = session_summary(stopped) + "\nСейчас больше нечего повторять."
         if status:
             await status.edit_text(text)
@@ -101,7 +125,7 @@ async def send_task(
             await message.answer(text)
         return
     options = list(task.get("options") or [])
-    markup = answer_keyboard(task["task_id"], options)
+    markup = answer_keyboard(task["task_id"], options) or skip_keyboard(task["task_id"])
     if status:
         await status.edit_text(task_text(task), reply_markup=markup)
     else:
@@ -146,8 +170,10 @@ async def finish_answer(
             )
             await status.edit_text(
                 "Не удалось проверить ответ. Можно повторить проверку, изменить ответ "
-                "или засчитать его неверным.",
-                reply_markup=grading_failure_keyboard(task_id, verdict["evaluation_id"]),
+                "или перейти дальше без оценки.",
+                reply_markup=grading_failure_keyboard(
+                    task_id, verdict["evaluation_id"]
+                ),
             )
             return
         try:
@@ -164,6 +190,10 @@ async def finish_answer(
                 decision=grade.decision,
                 feedback=grade.feedback_ru,
                 model=grader.model,
+                target_reproduced=grade.target_reproduced,
+                task_valid=grade.task_valid,
+                comparison_expression=grade.comparison_expression,
+                corrected_answer=grade.corrected_answer,
             )
         except llm.BudgetExceeded as exc:
             await scheduler.fail_tutor_evaluation(
@@ -171,8 +201,10 @@ async def finish_answer(
                 error=str(exc), model=grader.model,
             )
             await status.edit_text(
-                "Лимит проверки ответов исчерпан. Можно изменить ответ или засчитать его неверным.",
-                reply_markup=grading_failure_keyboard(task_id, verdict["evaluation_id"]),
+                "Лимит проверки ответов исчерпан. Можно изменить ответ или перейти дальше без оценки.",
+                reply_markup=grading_failure_keyboard(
+                    task_id, verdict["evaluation_id"]
+                ),
             )
             return
         except Exception as exc:
@@ -183,8 +215,10 @@ async def finish_answer(
             )
             await status.edit_text(
                 "Не удалось проверить ответ. Можно повторить проверку, изменить ответ "
-                "или засчитать его неверным.",
-                reply_markup=grading_failure_keyboard(task_id, verdict["evaluation_id"]),
+                "или перейти дальше без оценки.",
+                reply_markup=grading_failure_keyboard(
+                    task_id, verdict["evaluation_id"]
+                ),
             )
             return
         if verdict.get("stale"):
@@ -192,7 +226,12 @@ async def finish_answer(
             return
         await status.edit_text(
             verdict_text(verdict),
-            reply_markup=post_answer_keyboard(task_id, youglish_query(verdict)),
+            parse_mode="HTML",
+            reply_markup=post_answer_keyboard(
+                task_id,
+                youglish_query(verdict),
+                can_compare=bool(verdict.get("can_compare")),
+            ),
         )
         edit = False
     else:
@@ -200,25 +239,72 @@ async def finish_answer(
         if edit:
             original = message.text or "Упражнение"
             await message.edit_text(
-                f"{original}\n\n{rendered}",
-                reply_markup=post_answer_keyboard(task_id, youglish_query(verdict)),
+                f"{escape(original)}\n\n{rendered}",
+                parse_mode="HTML",
+                reply_markup=post_answer_keyboard(
+                    task_id,
+                    youglish_query(verdict),
+                    can_compare=bool(verdict.get("can_compare")),
+                ),
             )
         else:
             await message.answer(
                 rendered,
-                reply_markup=post_answer_keyboard(task_id, youglish_query(verdict)),
+                parse_mode="HTML",
+                reply_markup=post_answer_keyboard(
+                    task_id,
+                    youglish_query(verdict),
+                    can_compare=bool(verdict.get("can_compare")),
+                ),
             )
     if verdict.get("session_complete"):
-        await message.answer(
-            session_summary(
-                {
-                    "answered_count": verdict.get("session_answered_count") or 0,
-                    "correct_count": verdict.get("session_correct_count") or 0,
-                }
-            )
-        )
+        await message.answer(_verdict_summary(verdict))
         return
-    await send_task(message, database, learner, context_generator)
+    if verdict.get("can_compare"):
+        return
+    await send_task(
+        message, database, learner, context_generator, previous_task_id=task_id
+    )
+
+
+def _verdict_summary(verdict: dict[str, Any]) -> str:
+    return session_summary(
+        {
+            "answered_count": verdict.get("session_answered_count") or 0,
+            "assessed_count": verdict.get("session_assessed_count") or 0,
+            "correct_count": verdict.get("session_correct_count") or 0,
+        }
+    )
+
+
+async def _skip_and_advance(
+    callback: CallbackQuery,
+    task_id: str,
+    database: db.Database,
+    learner: dict[str, Any],
+    context_generator: ContextExerciseService | None,
+) -> None:
+    verdict = await scheduler.skip_task(database, learner["id"], task_id)
+    if verdict.get("error"):
+        await callback.answer("Упражнение уже неактивно")
+        return
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        verdict_text(verdict),
+        parse_mode="HTML",
+        reply_markup=post_answer_keyboard(task_id, youglish_query(verdict)),
+    )
+    if verdict.get("session_complete"):
+        await callback.message.answer(_verdict_summary(verdict))
+    else:
+        await send_task(
+            callback.message,
+            database,
+            learner,
+            context_generator,
+            previous_task_id=task_id,
+        )
 
 
 @router.callback_query(GradeCallback.filter())
@@ -233,21 +319,10 @@ async def resolve_grade_failure(
     if not isinstance(callback.message, Message):
         await callback.answer()
         return
-    if callback_data.action == "wrong":
-        verdict = await scheduler.override_answer_incorrect(
-            database, learner["id"], callback_data.task_id
+    if callback_data.action in {"wrong", "skip"}:
+        await _skip_and_advance(
+            callback, callback_data.task_id, database, learner, context_generator
         )
-        if verdict.get("error"):
-            await callback.answer("Упражнение уже неактивно")
-            return
-        await callback.answer()
-        await callback.message.edit_text(
-            verdict_text(verdict),
-            reply_markup=post_answer_keyboard(
-                callback_data.task_id, youglish_query(verdict)
-            ),
-        )
-        await send_task(callback.message, database, learner, context_generator)
         return
     if callback_data.action != "retry":
         await callback.answer("Неизвестное действие")
@@ -279,6 +354,7 @@ async def start(message: Message) -> None:
         "/practice — длинная тренировка\n"
         "/quick — быстрая тренировка на 5 минут\n"
         "/context — бесконечная практика в новых контекстах\n"
+        "/contrast слово / другое слово — 3 упражнения на различия\n"
         "/decks — колоды\n"
         "/stats — статистика\n"
         "/howto — как работает обучение\n"
@@ -286,6 +362,133 @@ async def start(message: Message) -> None:
         "/issues — карточки, требующие исправления\n"
         "/stop — остановить тренировку"
     )
+
+
+async def _start_comparison(
+    message: Message,
+    database: db.Database,
+    learner: dict[str, Any],
+    generator: ContextExerciseService | None,
+    *,
+    word_id: int,
+    alternative: str,
+    source_task_id: str | None = None,
+    source_prompt: str = "",
+) -> None:
+    if generator is None or not generator.available:
+        await message.answer("Для тренировки различий нужен настроенный преподаватель.")
+        return
+    session = await scheduler.start_session(
+        database,
+        learner["id"],
+        kind="context",
+        target_count=3,
+        comparison={
+            "word_id": word_id,
+            "alternative": alternative,
+            "source_task_id": source_task_id,
+            "source_prompt": source_prompt,
+        },
+    )
+    if session.get("already_active"):
+        return
+    await message.answer(
+        "Начинаю отдельную тренировку различий: 3 контекста. Иногда подходят оба варианта. Интервалы слов не изменятся."
+    )
+    await send_task(message, database, learner, generator)
+
+
+@router.message(Command("contrast"))
+async def contrast_practice(
+    message: Message,
+    database: db.Database,
+    learner: dict[str, Any],
+    context_generator: ContextExerciseService,
+) -> None:
+    pair = (message.text or "").partition(" ")[2].split(" / ", 1)
+    if (
+        len(pair) != 2
+        or not all(part.strip() for part in pair)
+        or len(pair[1].strip()) > 500
+    ):
+        await message.answer(
+            "Укажите два слова или выражения: /contrast verfügbar / zugänglich. Первое слово должно быть в вашей колоде."
+        )
+        return
+    word = await words.get_word(database, learner["id"], pair[0].strip())
+    if word is None:
+        await message.answer("Первое слово не найдено в ваших колодах.")
+        return
+    if word.lemma.casefold() == pair[1].strip().casefold():
+        await message.answer("Укажите два разных слова или выражения.")
+        return
+    try:
+        await _start_comparison(
+            message,
+            database,
+            learner,
+            context_generator,
+            word_id=word.db_id,
+            alternative=pair[1].strip(),
+        )
+    except ValueError:
+        await message.answer("Для сравнения выберите активное слово из вашей колоды.")
+
+
+@router.callback_query(FlowCallback.filter())
+async def flow_action(
+    callback: CallbackQuery,
+    callback_data: FlowCallback,
+    database: db.Database,
+    learner: dict[str, Any],
+    context_generator: ContextExerciseService,
+) -> None:
+    if not isinstance(callback.message, Message):
+        await callback.answer()
+        return
+    if callback_data.action == "skip":
+        await _skip_and_advance(
+            callback, callback_data.task_id, database, learner, context_generator
+        )
+        return
+    task = await scheduler.task_context(database, learner["id"], callback_data.task_id)
+    if not task or task["status"] != "answered":
+        await callback.answer("Упражнение уже неактивно")
+        return
+    if callback_data.action in {"next", "continue"}:
+        await callback.answer()
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await send_task(
+            callback.message,
+            database,
+            learner,
+            context_generator,
+            previous_task_id=callback_data.task_id,
+        )
+    elif (
+        callback_data.action == "compare"
+        and task["verdict"].get("neutral_reason") == "alternative"
+        and task["verdict"].get("comparison_expression")
+        and task["answer_language"] == task["language"]
+    ):
+        await callback.answer()
+        try:
+            await _start_comparison(
+                callback.message,
+                database,
+                learner,
+                context_generator,
+                word_id=task["word_id"],
+                alternative=task["verdict"]["comparison_expression"],
+                source_task_id=callback_data.task_id,
+                source_prompt=task["payload"].get("prompt", ""),
+            )
+        except ValueError:
+            await callback.message.answer(
+                "Для сравнения выберите активное слово из вашей колоды."
+            )
+    else:
+        await callback.answer("Действие недоступно")
 
 
 @router.message(Command("practice"))
@@ -352,7 +555,8 @@ async def stats(message: Message, database: db.Database, learner: dict[str, Any]
 
 @router.message(Command("howto", "help"))
 async def howto(message: Message) -> None:
-    await message.answer(learning_guide_text())
+    for chunk in telegram_text_chunks(learning_guide_text()):
+        await message.answer(chunk)
 
 
 async def _issues_page(database: db.Database, learner: dict[str, Any], page: int) -> tuple[str, Any]:
@@ -547,6 +751,8 @@ async def answer_button(
     callback_data: AnswerCallback,
     database: db.Database,
     learner: dict[str, Any],
+    grader: TutorGraderService | None = None,
+    context_generator: ContextExerciseService | None = None,
 ) -> None:
     if not isinstance(callback.message, Message):
         await callback.answer()
@@ -567,6 +773,8 @@ async def answer_button(
         callback_data.task_id,
         str(options[callback_data.option]),
         edit=True,
+        grader=grader,
+        context_generator=context_generator,
     )
 
 

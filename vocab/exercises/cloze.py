@@ -10,7 +10,7 @@ from psycopg import AsyncConnection
 
 from ..languages import ExerciseContext
 from ..models import Noun, Phrase, Verb, Word
-from .base import CheckResult, GeneratedExercise, check_text, fold_umlauts
+from .base import CheckResult, GeneratedExercise, check_text
 
 UMLAUT_MAP = [("au", "äu"), ("a", "ä"), ("o", "ö"), ("u", "ü")]
 SEPARABLE_PREFIXES = (
@@ -20,10 +20,64 @@ SEPARABLE_PREFIXES = (
 )
 
 
+REFLEXIVE_PRONOUNS = {"mich", "dich", "sich", "uns", "euch"}
+AUXILIARY_FORMS = {
+    "bin",
+    "bist",
+    "ist",
+    "sind",
+    "seid",
+    "war",
+    "warst",
+    "waren",
+    "wart",
+    "habe",
+    "hast",
+    "hat",
+    "haben",
+    "habt",
+    "hatte",
+    "hattest",
+    "hatten",
+    "hattet",
+    "werde",
+    "wirst",
+    "wird",
+    "werden",
+    "werdet",
+    "wurde",
+    "wurdest",
+    "wurden",
+    "wurdet",
+}
+
+
 def candidate_forms(word: Word) -> set[str]:
-    if isinstance(word, Verb):
-        return word.all_form_tokens() | {word.lemma}
-    return set()
+    """Lexical verb forms, excluding auxiliaries, pronouns, and particles.
+
+    A conjugation cell can end in a separable prefix (``ich rufe an``) or a
+    reflexive pronoun (``ich freue mich``), so taking its final token produces
+    gaps unrelated to the card's learning target.  In a simple form the
+    lexical verb is the first token after the subject; with an auxiliary it is
+    the final content token (the participle or infinitive).
+    """
+    if not isinstance(word, Verb):
+        return set()
+    forms = {word.lemma}
+    for tense, cells in word.conjugation.items():
+        for person_idx, _cell in enumerate(cells):
+            form = word.form(tense, person_idx)
+            tokens = re.findall(r"[A-Za-zÄÖÜäöüß]+", form)
+            content = [
+                token for token in tokens if token.casefold() not in REFLEXIVE_PRONOUNS
+            ]
+            if not content:
+                continue
+            target = (
+                content[-1] if content[0].casefold() in AUXILIARY_FORMS else content[0]
+            )
+            forms.add(target)
+    return forms
 
 
 def _vowel_variants(stem: str) -> list[str]:
@@ -96,7 +150,7 @@ async def generate(
     sentence = re.sub(rf"\b{re.escape(target)}\b", gap, word.example, count=1)
     payload = {
         "prompt": f"Вставь пропущенное слово: {sentence}",
-        "hint": f"{word.translation} ({word.lemma})",
+        "hint": word.translation,
     }
     expected = {"answer": target, "sentence": word.example}
     return GeneratedExercise(

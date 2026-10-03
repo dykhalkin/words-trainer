@@ -88,7 +88,7 @@ class AgentSchemaTests(unittest.TestCase):
         self.assertEqual(card.kind, "phrase")
         self.assertEqual(card.phrase_type, "fixed")
         self.assertIn("For any studied language", INSTRUCTIONS)
-        self.assertIn("A synonymous expression", GRADER_INSTRUCTIONS)
+        self.assertIn("A different synonym is accepted", GRADER_INSTRUCTIONS)
         schema = AgentWordCard.model_json_schema()["properties"]
         self.assertIn("collocation", schema["phrase_type"]["description"])
 
@@ -97,8 +97,8 @@ class AgentSchemaTests(unittest.TestCase):
 
         self.assertIn("recent_contexts", CONTEXT_INSTRUCTIONS)
         self.assertIn("never multiple choice", CONTEXT_INSTRUCTIONS)
-        self.assertIn("never\n  a bare noun", CONTEXT_INSTRUCTIONS)
-        self.assertIn("exercise_type=context_llm", GRADER_INSTRUCTIONS)
+        self.assertEqual(schema["required_elements"]["maxItems"], 0)
+        self.assertIn("For free_expression", GRADER_INSTRUCTIONS)
         self.assertIn("required_elements", schema)
         self.assertIn("context_tag", schema)
 

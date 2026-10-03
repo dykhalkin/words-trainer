@@ -232,12 +232,19 @@ class TwoPhaseGradingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(task["answer_language"], task["language"])
                 self.assertEqual(task["grading_policy"], "tutor_on_mismatch")
             else:
-                self.assertIsNone(task["answer_language"])
-                self.assertEqual(task["grading_policy"], "deterministic")
+                if task["type"] in {"choice", "choice_ru_de"}:
+                    self.assertEqual(
+                        task["answer_language"],
+                        "ru" if task["type"] == "choice" else task["language"],
+                    )
+                    self.assertEqual(task["grading_policy"], "tutor_on_mismatch")
+                else:
+                    self.assertIsNone(task["answer_language"])
+                    self.assertEqual(task["grading_policy"], "deterministic")
 
     async def test_tutor_decisions_map_to_fixed_quality_and_provenance(self) -> None:
         for decision, quality, correct in (
-            ("accepted", 4, True),
+            ("accepted", 5, True),
             ("partial", 3, True),
             ("rejected", 1, False),
         ):

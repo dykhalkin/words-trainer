@@ -36,6 +36,8 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
                     {"version": "012_quick_sessions.sql"},
                     {"version": "013_phrase_cards.sql"},
                     {"version": "014_context_sessions.sql"},
+                    {"version": "015_fair_synonym_practice.sql"},
+                    {"version": "016_compact_synonym_practice.sql"},
                 ],
             )
 

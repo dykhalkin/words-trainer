@@ -35,6 +35,46 @@ from bot.presentation import (
 
 
 class BotPresentationTests(unittest.TestCase):
+    def test_youglish_query_focuses_phrase_on_lexical_pronunciation(self) -> None:
+        cases = {
+            "eingespannt sein": "eingespannt",
+            "schlecht gelaunt sein": "schlecht gelaunt",
+            "mit nichts zufrieden sein": "mit nichts zufrieden",
+            "eine feste Clique sein": "eine feste Clique",
+            "gut mit Menschen umgehen können": "gut mit Menschen umgehen",
+        }
+        for phrase, expected in cases.items():
+            with self.subTest(phrase=phrase):
+                self.assertEqual(
+                    youglish_query({"word": phrase, "kind": "phrase"}),
+                    expected,
+                )
+
+        self.assertEqual(
+            youglish_query(
+                {
+                    "word": "auf … eifersüchtig sein",
+                    "kind": "phrase",
+                    "example": "Er ist auf seinen Bruder eifersüchtig.",
+                }
+            ),
+            "eifersüchtig",
+        )
+        self.assertEqual(
+            youglish_query(
+                {
+                    "word": "seit … Jahren befreundet sein",
+                    "kind": "phrase",
+                    "example": "Wir sind seit zehn Jahren befreundet.",
+                }
+            ),
+            "befreundet",
+        )
+        self.assertEqual(
+            youglish_query({"word": "Fieber haben", "kind": "other"}),
+            "Fieber haben",
+        )
+
     def test_callback_payload_is_compact_and_keyboard_keeps_answer_server_side(self) -> None:
         packed = AnswerCallback(task_id="1234567890abcdef", option=3).pack()
         self.assertLessEqual(len(packed.encode()), 64)
@@ -154,7 +194,7 @@ class BotPresentationTests(unittest.TestCase):
         )
         self.assertEqual(
             verdict_text({"correct": True, "expected": "gehen", "note": None}),
-            "✅ Верно\nОтвет: gehen",
+            "<b>✅ Верно</b>\n\n<b>gehen</b>",
         )
         self.assertEqual(
             verdict_text(
@@ -165,8 +205,8 @@ class BotPresentationTests(unittest.TestCase):
                     "example": "Ich gehe nach Hause.",
                 }
             ),
-            "❌ Не совсем\nОтвет: gehen\nПроверьте форму.\n\n"
-            "Пример: Ich gehe nach Hause.",
+            "<b>❌ Не совсем</b>\n\n<b>gehen</b>\n\nПроверьте форму.\n\n"
+            "<blockquote>Ich gehe nach Hause.</blockquote>",
         )
         self.assertEqual(
             verdict_text(
@@ -178,8 +218,8 @@ class BotPresentationTests(unittest.TestCase):
                     "example": "Die Salbe hilft.",
                 }
             ),
-            "❌ Не совсем\nСлово: die Salbe\nОтвет: die Salbe\n"
-            "Артикль обязателен.\n\nПример для «die Salbe»: Die Salbe hilft.",
+            "<b>❌ Не совсем</b>\n\n<b>die Salbe</b>\n\n"
+            "Артикль обязателен.\n\n<blockquote>Die Salbe hilft.</blockquote>",
         )
         self.assertEqual(
             verdict_text(
@@ -191,8 +231,8 @@ class BotPresentationTests(unittest.TestCase):
                     "example": "Ich komme auf jeden Fall.",
                 }
             ),
-            "✅ Верно\nФраза: auf jeden Fall\nОтвет: auf jeden Fall\n\n"
-            "Пример фразы «auf jeden Fall»: Ich komme auf jeden Fall.",
+            "<b>✅ Верно</b>\n\n<b>auf jeden Fall</b>\n\n"
+            "<blockquote>Ich komme auf jeden Fall.</blockquote>",
         )
         tense_verdict = verdict_text(
             {
@@ -211,14 +251,30 @@ class BotPresentationTests(unittest.TestCase):
             }
         )
         self.assertIn(
-            "Времена (er/es/sie): Präsens: baut auf · "
-            "Perfekt: hat aufgebaut · Präteritum: baute auf",
+            "<b>Формы · er/es/sie</b>\nPräsens: baut auf\n"
+            "Perfekt: hat aufgebaut\nPräteritum: baute auf",
             tense_verdict,
         )
         self.assertEqual(
             session_summary({"answered_count": 5, "correct_count": 4}),
             "Тренировка завершена: 4/5 правильных.",
         )
+
+    def test_verdict_html_escapes_learner_and_generated_content(self):
+        rendered = verdict_text(
+            {
+                "correct": False,
+                "answer": "<b>test</b>",
+                "expected": "A & B",
+                "translation": "<перевод>",
+                "note": "<script>unsafe</script>",
+                "example": "A < B & C",
+            }
+        )
+        self.assertIn("&lt;b&gt;test&lt;/b&gt; → <b>A &amp; B</b>", rendered)
+        self.assertIn("&lt;script&gt;unsafe&lt;/script&gt;", rendered)
+        self.assertIn("<blockquote>A &lt; B &amp; C</blockquote>", rendered)
+        self.assertNotIn("<перевод>", rendered)
 
     def test_stats_names_stages_without_explanations_or_word_lists(self) -> None:
         value = {
@@ -284,7 +340,8 @@ class BotPresentationTests(unittest.TestCase):
         )
         self.assertIn("Как изучаются фразы", rendered)
         self.assertIn("применить в короткой новой реплике", rendered)
-        self.assertIn("Подходящий синоним считается почти правильным", rendered)
+        self.assertIn("Подходящий синоним считается правильным", rendered)
+        self.assertIn("/contrast", rendered)
         self.assertIn("Команда /context", rendered)
         self.assertIn("не изменяет этап, интервал", rendered)
 

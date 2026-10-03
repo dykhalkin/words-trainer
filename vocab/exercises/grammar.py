@@ -39,7 +39,9 @@ async def generate(
         return None
     payload, expected = produced
     if payload.get("options"):
-        return GeneratedExercise(payload, expected, "choice", None, "deterministic")
+        return GeneratedExercise(
+            payload, expected, "choice", None, "deterministic", objective="recognition"
+        )
     return GeneratedExercise(
         payload, expected, "free_text", context.language, "tutor_on_mismatch"
     )

@@ -16,6 +16,10 @@ class GeneratedExercise:
     response_mode: Literal["choice", "free_text"]
     answer_language: str | None
     grading_policy: Literal["deterministic", "tutor_on_mismatch"]
+    objective: Literal[
+        "recall", "recognition", "target_usage", "free_expression", "contrast"
+    ] = "recall"
+    visible_constraints: dict[str, Any] | None = None
 
     def __iter__(self):
         """Keep tuple unpacking compatible for low-level generator callers."""

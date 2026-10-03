@@ -53,8 +53,14 @@ async def generate(
         "prompt": f"Что означает «{display_lemma(word)}»?",
         "options": options,
     }
-    expected = {"correct_index": correct_idx, "correct_text": word.translation}
-    return GeneratedExercise(payload, expected, "choice", None, "deterministic")
+    expected = {
+        "correct_index": correct_idx,
+        "correct_text": word.translation,
+        "options": options,
+    }
+    return GeneratedExercise(
+        payload, expected, "choice", "ru", "tutor_on_mismatch", objective="recognition"
+    )
 
 
 def check(expected: dict, answer: str) -> CheckResult:

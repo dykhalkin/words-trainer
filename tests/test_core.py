@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import random
 import unittest
 from datetime import datetime, timezone
@@ -11,6 +12,7 @@ from vocab.exercises.base import (
     short_verb_tense_strip,
     verb_prep_answer_variants,
 )
+from vocab.languages import ExerciseContext
 from vocab.models import Noun, Phrase, Verb, VerbPrep
 
 
@@ -84,6 +86,66 @@ class SrsTests(unittest.TestCase):
 
 
 class ExerciseTests(unittest.TestCase):
+    def test_cloze_targets_verb_instead_of_reflexive_pronoun(self) -> None:
+        verb = Verb(
+            lemma="sich freuen",
+            kind="verb",
+            translation="радоваться",
+            example="Ich freue mich auf das Wochenende.",
+            pronunciation="фройен",
+            conjugation={
+                "praesens": [
+                    "ich freue mich",
+                    "du freust dich",
+                    "er/es/sie freut sich",
+                    "wir freuen uns",
+                    "ihr freut euch",
+                    "Sie freuen sich",
+                ],
+                "perfekt": [
+                    "ich habe mich gefreut",
+                    "du hast dich gefreut",
+                    "er/es/sie hat sich gefreut",
+                    "wir haben uns gefreut",
+                    "ihr habt euch gefreut",
+                    "Sie haben sich gefreut",
+                ],
+                "praeteritum": [
+                    "ich freute mich",
+                    "du freutest dich",
+                    "er/es/sie freute sich",
+                    "wir freuten uns",
+                    "ihr freutet euch",
+                    "Sie freuten sich",
+                ],
+            },
+        )
+
+        self.assertEqual(cloze.find_blank(verb), "freue")
+        self.assertTrue(
+            {"mich", "dich", "sich", "uns", "euch"}.isdisjoint(
+                cloze.candidate_forms(verb)
+            )
+        )
+
+    def test_cloze_targets_lexical_part_of_separable_verb(self) -> None:
+        verb = self._verb()
+
+        self.assertEqual(cloze.find_blank(verb), "baut")
+        self.assertNotIn("auf", cloze.candidate_forms(verb))
+
+        exercise = asyncio.run(
+            cloze.generate(
+                verb,
+                None,  # type: ignore[arg-type]
+                random.Random(1),
+                ExerciseContext(user_id=1, language="de"),
+            )
+        )
+        self.assertIsNotNone(exercise)
+        self.assertEqual(exercise.payload["hint"], "строить")
+        self.assertNotIn(verb.lemma, exercise.payload["hint"])
+
     @staticmethod
     def _verb() -> Verb:
         return Verb(
@@ -227,19 +289,24 @@ class ExerciseTests(unittest.TestCase):
 
     def test_phrase_cloze_uses_the_phrase_as_one_learning_unit(self) -> None:
         self.assertEqual(
-            phrase.phrase_gap("eine Entscheidung treffen"),
-            ("eine Entscheidung _______", "treffen"),
+            phrase.phrase_gap(
+                "eine Entscheidung treffen",
+                "Wir müssen eine Entscheidung treffen.",
+            ),
+            ("Wir müssen _________________________.", "eine Entscheidung treffen"),
         )
-        self.assertEqual(
-            phrase.phrase_gap("es kommt auf … an"),
-            ("es kommt auf … ____", "an"),
+        self.assertIsNone(
+            phrase.phrase_gap(
+                "es kommt auf … an",
+                "Es kommt auf das Wetter an.",
+            )
         )
         expected = {
-            "answer": "treffen",
+            "answer": "eine Entscheidung treffen",
             "phrase": "eine Entscheidung treffen",
-            "accepted": ["treffen", "eine Entscheidung treffen"],
+            "accepted": ["eine Entscheidung treffen"],
         }
-        self.assertTrue(phrase.Cloze.check(expected, "treffen").correct)
+        self.assertFalse(phrase.Cloze.check(expected, "treffen").correct)
         self.assertTrue(
             phrase.Cloze.check(expected, "eine Entscheidung treffen").correct
         )

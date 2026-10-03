@@ -55,8 +55,19 @@ async def generate(
         "prompt": f"Как {prompt_name} «{word.translation}»?",
         "options": options,
     }
-    expected = {"correct_index": correct_idx, "correct_text": visible_word}
-    return GeneratedExercise(payload, expected, "choice", None, "deterministic")
+    expected = {
+        "correct_index": correct_idx,
+        "correct_text": visible_word,
+        "options": options,
+    }
+    return GeneratedExercise(
+        payload,
+        expected,
+        "choice",
+        context.language,
+        "tutor_on_mismatch",
+        objective="recognition",
+    )
 
 
 def check(expected: dict, answer: str) -> CheckResult:

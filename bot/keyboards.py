@@ -63,6 +63,24 @@ class GradeCallback(CallbackData, prefix="g"):
     action: str
 
 
+class FlowCallback(CallbackData, prefix="f"):
+    task_id: str
+    action: str
+
+
+def skip_keyboard(task_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Показать ответ и пропустить",
+                    callback_data=FlowCallback(task_id=task_id, action="skip").pack(),
+                )
+            ]
+        ]
+    )
+
+
 class ReminderCallback(CallbackData, prefix="r"):
     action: str
     value: str = ""
@@ -194,8 +212,10 @@ def youglish_url(query: str) -> str:
     return f"https://youglish.com/pronounce/{quote(query, safe='')}/german"
 
 
-def post_answer_keyboard(task_id: str, query: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+def post_answer_keyboard(
+    task_id: str, query: str, *, can_compare: bool = False
+) -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
@@ -220,9 +240,26 @@ def post_answer_keyboard(task_id: str, query: str) -> InlineKeyboardMarkup:
                         task_id=task_id, action="flag", confirm=0
                     ).pack(),
                 ),
-            ]
+            ],
         ]
     )
+    if can_compare:
+        markup.inline_keyboard.insert(
+            0,
+            [
+                InlineKeyboardButton(
+                    text="Различия · 3 задания",
+                    callback_data=FlowCallback(
+                        task_id=task_id, action="compare"
+                    ).pack(),
+                ),
+                InlineKeyboardButton(
+                    text="Дальше",
+                    callback_data=FlowCallback(task_id=task_id, action="next").pack(),
+                ),
+            ],
+        )
+    return markup
 
 
 def grading_failure_keyboard(task_id: str, evaluation_id: str) -> InlineKeyboardMarkup:
@@ -238,11 +275,11 @@ def grading_failure_keyboard(task_id: str, evaluation_id: str) -> InlineKeyboard
                     ).pack(),
                 ),
                 InlineKeyboardButton(
-                    text="❌ Засчитать неверным",
+                    text="Дальше без оценки",
                     callback_data=GradeCallback(
                         task_id=task_id,
                         evaluation_id=evaluation_id,
-                        action="wrong",
+                        action="skip",
                     ).pack(),
                 ),
             ]
