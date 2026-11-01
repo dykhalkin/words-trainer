@@ -823,7 +823,8 @@ async def word_action(
         await callback.answer()
         await callback.message.edit_reply_markup(reply_markup=None)
         await callback.message.answer(
-            f"Что нужно исправить в карточке «{context['word']}»? "
+            f"Карточка «{context['word']}» помечена и исключена из тренировок. "
+            "Что в ней неверно? "
             "Опишите ошибку одним сообщением."
         )
         return

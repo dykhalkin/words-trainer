@@ -80,7 +80,6 @@ async def handle_card_feedback(
     message: Message,
     database: db.Database,
     learner: dict[str, Any],
-    tutor: TutorService,
     context_generator: ContextExerciseService,
 ) -> bool:
     pending = await reminders.get_pending_action(database, learner["id"])
@@ -93,57 +92,21 @@ async def handle_card_feedback(
     if len(feedback) > 2000:
         await message.answer("Комментарий слишком длинный. Сократите его до 2000 символов.")
         return True
-    await reminders.clear_pending_action(database, learner["id"])
     task_id = str(pending["payload"]["task_id"])
-    flagged = await words.flag_answered_task_word(
+    flagged = await words.save_card_feedback(
         database,
         learner["id"],
         task_id,
         reason=feedback,
     )
     if not flagged:
-        await message.answer("Карточка или контекст упражнения уже недоступны.")
+        await reminders.clear_pending_action(database, learner["id"])
+        await message.answer("Пометка уже обработана или контекст упражнения недоступен.")
         return True
-    if not tutor.available:
-        await message.answer(
-            "Комментарий сохранён, карточка исключена из тренировок. "
-            "Tutor сейчас недоступен, поэтому она осталась в списке /issues."
-        )
-        await _resume_training_if_needed(
-            message, database, learner, context_generator
-        )
-        return True
-    status = await message.answer("Tutor проверяет комментарий и исправляет карточку…")
-    try:
-        correction = await tutor.correct_card(
-            database,
-            learner,
-            task_id=task_id,
-            feedback=feedback,
-        )
-    except llm.BudgetExceeded:
-        await status.edit_text(
-            "Комментарий сохранён, но лимит tutor исчерпан. "
-            "Карточка осталась в списке /issues."
-        )
-        await _resume_training_if_needed(
-            message, database, learner, context_generator
-        )
-        return True
-    except Exception:
-        logger.exception("card correction failed")
-        await status.edit_text(
-            "Комментарий сохранён, но tutor не смог обновить карточку. "
-            "Она осталась в списке /issues."
-        )
-        await _resume_training_if_needed(
-            message, database, learner, context_generator
-        )
-        return True
-    card = correction.corrected_card
-    await status.edit_text(
-        f"Карточка обновлена: {card.lemma} — {card.translation}\n"
-        f"{correction.summary_ru}"
+    await reminders.clear_pending_action(database, learner["id"])
+    await message.answer(
+        "Комментарий сохранён. Карточка остаётся вне тренировок до отдельного "
+        "разбора и исправления. Список пометок — /issues."
     )
     await _resume_training_if_needed(message, database, learner, context_generator)
     return True
@@ -159,7 +122,7 @@ async def text_answer_or_chat(
     context_generator: ContextExerciseService,
 ) -> None:
     if await handle_card_feedback(
-        message, database, learner, tutor, context_generator
+        message, database, learner, context_generator
     ):
         return
     task = await scheduler.get_open_task(database, learner["id"])
